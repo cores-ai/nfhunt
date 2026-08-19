@@ -6,6 +6,17 @@ import uuid
 import subprocess
 import sys
 import fast_api_checker
+from deep_translator import GoogleTranslator
+
+def safe_translate(text, target='en'):
+    if not text or text in ("N/A", "Unable to fetch"):
+        return text
+    try:
+        translated = GoogleTranslator(source='auto', target=target).translate(text)
+        return translated if translated else text
+    except Exception as e:
+        logger.error(f"Translation error: {e}")
+        return text
 
 # Configure logging - LIVE DEBUG MODE
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -191,7 +202,8 @@ async def fetch_account_details(cookies: list[dict]) -> dict | None:
                     
                     for element in verification_status_elements:
                         element_text = await element.inner_text()
-                        if "needs verification" in element_text.lower() or "verify" in element_text.lower():
+                        translated_text = safe_translate(element_text).lower()
+                        if "needs verification" in translated_text or "verify" in translated_text or "verific" in translated_text:
                             if phone_number != "N/A" and phone_number in element_text:
                                 phone_verified = "❌ Non-verified"
                             if email != "N/A" and email in element_text:
@@ -202,13 +214,14 @@ async def fetch_account_details(cookies: list[dict]) -> dict | None:
                     
                     for button in verify_buttons:
                         button_text = await button.inner_text()
+                        translated_btn = safe_translate(button_text).lower()
                         button_html = await button.inner_html()
                         
                         # If there's a verify button, it means verification is needed
-                        if "verify" in button_text.lower():
-                            if phone_number != "N/A" and (phone_number in button_html or "phone" in button_text.lower()):
+                        if "verify" in translated_btn or "verific" in translated_btn:
+                            if phone_number != "N/A" and (phone_number in button_html or "phone" in translated_btn):
                                 phone_verified = "❌ Non-verified"
-                            if email != "N/A" and (email in button_html or "email" in button_text.lower()):
+                            if email != "N/A" and (email in button_html or "email" in translated_btn):
                                 email_verified = "❌ Non-verified"
                                 
                 except Exception as e:
@@ -287,6 +300,13 @@ async def fetch_account_details(cookies: list[dict]) -> dict | None:
                     package_str = package_match.group(2).strip()
                     if package_str:
                         package = package_str
+
+            if plan != "N/A":
+                plan = safe_translate(plan)
+            if member_since != "N/A":
+                member_since = safe_translate(member_since)
+            if package != "N/A":
+                package = safe_translate(package)
 
             btn = await page.query_selector('button[data-uia="account+footer+service-code-button"]')
             if btn:
@@ -538,8 +558,9 @@ async def get_last_viewed_content(page) -> str:
                 if last_viewed_element:
                     last_viewed = await last_viewed_element.inner_text()
                     if last_viewed and last_viewed.strip():
-                        logger.info(f"✅ Found last viewed: {last_viewed.strip()}")
-                        return last_viewed.strip()
+                        translated_viewed = safe_translate(last_viewed.strip())
+                        logger.info(f"✅ Found last viewed: {translated_viewed}")
+                        return translated_viewed
             except Exception:
                 continue
         
@@ -550,8 +571,9 @@ async def get_last_viewed_content(page) -> str:
                 for title_element in all_titles[:3]:  # Check first 3 titles
                     title_text = await title_element.inner_text()
                     if title_text and title_text.strip():
-                        logger.info(f"✅ Found viewing activity title: {title_text.strip()}")
-                        return title_text.strip()
+                        translated_title = safe_translate(title_text.strip())
+                        logger.info(f"✅ Found viewing activity title: {translated_title}")
+                        return translated_title
         except Exception:
             pass
             

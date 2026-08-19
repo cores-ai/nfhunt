@@ -759,6 +759,55 @@ _Select a plan below to buy!_
             await send_referral_info(update, context)
             return
             
+        # Check if the user sent one or more nftoken URLs
+        import aiohttp
+        import ssl
+        tokens = re.findall(r'nftoken=([^&\s]+)', text)
+        if tokens:
+            if not context.user_data.get('processing_msg_id'):
+                processing_msg = await update.message.reply_text("🔄 *Exchanging tokens for cookies...*", parse_mode='Markdown')
+                context.user_data['processing_msg_id'] = processing_msg.message_id
+            
+            ssl_ctx = ssl.create_default_context()
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = ssl.CERT_NONE
+            
+            new_cookie_texts = []
+            
+            async with aiohttp.ClientSession() as session:
+                for token in tokens:
+                    try:
+                        session.cookie_jar.clear()
+                        # Setting User-Agent to avoid generic blocks
+                        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
+                        async with session.get(f"https://www.netflix.com/account?nftoken={token}", headers=headers, ssl=ssl_ctx, allow_redirects=False) as resp:
+                            netflix_id = ""
+                            for cookie in session.cookie_jar:
+                                if cookie.key == "NetflixId":
+                                    netflix_id = cookie.value
+                            if not netflix_id and resp.status in (301, 302, 303, 307, 308):
+                                async with session.get(f"https://www.netflix.com/account?nftoken={token}", headers=headers, ssl=ssl_ctx) as resp2:
+                                    for cookie in session.cookie_jar:
+                                        if cookie.key == "NetflixId":
+                                            netflix_id = cookie.value
+                            if netflix_id:
+                                fake_cookie = json.dumps([{"name": "NetflixId", "value": netflix_id, "domain": ".netflix.com", "path": "/"}])
+                                new_cookie_texts.append(fake_cookie)
+                    except Exception:
+                        pass
+                        
+            if new_cookie_texts:
+                # Replace text with JSON strings separated by newlines
+                text = "\n\n".join(new_cookie_texts)
+            else:
+                await context.bot.edit_message_text(
+                    chat_id=update.effective_chat.id,
+                    message_id=context.user_data['processing_msg_id'],
+                    text="❌ *TOKEN EXPIRED*\n\nThe provided token links are invalid or expired.",
+                    parse_mode='Markdown'
+                )
+                return
+                
         # Auto Detect logic
         netflix_keywords = ['netflix.com', 'netflixid', 'securenetflixid', 'cookie', 'nftoken']
         has_netflix = any(keyword in text.lower() for keyword in netflix_keywords) or text.startswith('[') or text.startswith('{')

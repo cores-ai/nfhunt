@@ -325,6 +325,50 @@ async def fetch_enhanced_account_details(cookies_list):
                     if prof_from_prof_page and (not info1.get('profiles') or len(prof_from_prof_page) > len(info1.get('profiles', ''))):
                         info1['profiles'] = prof_from_prof_page
                 
+                # Fetch security page to accurately determine email and phone verification status
+                try:
+                    async with session.get("https://www.netflix.com/account/security", headers=headers, ssl=ssl_ctx, timeout=20) as resp_sec:
+                        if resp_sec.status == 200:
+                            html_sec = await resp_sec.text()
+                            
+                            # 1. Parse any GraphQL JSON first
+                            info_sec = extract_info_from_graphql(html_sec)
+                            if info_sec.get('emailVerified') is not None:
+                                info1['emailVerified'] = info_sec['emailVerified']
+                            if info_sec.get('phoneVerified') is not None:
+                                info1['phoneVerified'] = info_sec['phoneVerified']
+                                
+                            # 2. Hard HTML fallback check for phone
+                            if info1.get('phoneVerified') is None:
+                                m_phone = re.search(r'data-uia="account-security-page\+account-details-card\+phone"[^>]*>([\s\S]{0,5000}?)</a>', html_sec, re.IGNORECASE)
+                                if m_phone:
+                                    phone_html = m_phone.group(1)
+                                    # Strip SVG and complex HTML before translation to reduce payload
+                                    clean_html = re.sub(r'<[^>]+>', ' ', phone_html)
+                                    translated_phone = _translate_to_english(clean_html).lower()
+                                    if 'needs verification' in translated_phone or 'verify' in translated_phone or 'verific' in translated_phone or 'unverified' in translated_phone:
+                                        info1['phoneVerified'] = "No"
+                                    elif info1.get('phoneNumber') and info1.get('phoneNumber') != 'N/A':
+                                        info1['phoneVerified'] = "Yes"
+                                    else:
+                                        info1['phoneVerified'] = "N/A"
+                                        
+                            # 3. Hard HTML fallback check for email
+                            if info1.get('emailVerified') is None:
+                                m_email = re.search(r'data-uia="account-security-page\+account-details-card\+email"[^>]*>([\s\S]{0,5000}?)</a>', html_sec, re.IGNORECASE)
+                                if m_email:
+                                    email_html = m_email.group(1)
+                                    clean_html = re.sub(r'<[^>]+>', ' ', email_html)
+                                    translated_email = _translate_to_english(clean_html).lower()
+                                    if 'needs verification' in translated_email or 'verify' in translated_email or 'verific' in translated_email or 'unverified' in translated_email:
+                                        info1['emailVerified'] = "No"
+                                    elif info1.get('email') and info1.get('email') != 'N/A':
+                                        info1['emailVerified'] = "Yes"
+                                    else:
+                                        info1['emailVerified'] = "N/A"
+                except Exception as e:
+                    logger.error(f"Error fetching security page: {e}")
+                
                 payment_method = info1.get('paymentMethodType', 'N/A')
                 masked_card = info1.get('maskedCard', 'N/A')
                 
@@ -387,8 +431,8 @@ async def fetch_enhanced_account_details(cookies_list):
                     'package': package_str,
                     'extra_members': extra_mems_str,
                     'last_viewed': last_viewed_date,
-                    'email_verified': "✅ Verified" if info1.get('emailVerified') == "Yes" else ("❌ Non-verified" if info1.get('emailVerified') == "No" else "N/A"),
-                    'phone_verified': "✅ Verified" if info1.get('phoneVerified') == "Yes" else ("❌ Non-verified" if info1.get('phoneVerified') == "No" else "N/A"),
+                    'email_verified': "✅ Verified" if info1.get('emailVerified') in ("Yes", "true", True) or str(info1.get('emailVerified')).lower() in ("yes", "sí", "oui", "ja", "sim", "evet", "true") else ("❌ Non-verified" if info1.get('emailVerified') in ("No", "false", False) or str(info1.get('emailVerified')).lower() in ("no", "non", "nein", "não", "hayır", "false") else "N/A"),
+                    'phone_verified': "✅ Verified" if info1.get('phoneVerified') in ("Yes", "true", True) or str(info1.get('phoneVerified')).lower() in ("yes", "sí", "oui", "ja", "sim", "evet", "true") else ("❌ Non-verified" if info1.get('phoneVerified') in ("No", "false", False) or str(info1.get('phoneVerified')).lower() in ("no", "non", "nein", "não", "hayır", "false") else "N/A"),
                     'has_dvd': False
                 }
                 
@@ -399,6 +443,15 @@ async def fetch_enhanced_account_details(cookies_list):
                     # Translate plan
                     result['plan'] = _translate_to_english(result['plan'])
                     
+                # Translate other fields
+                if result['member_since'] != 'N/A':
+                    result['member_since'] = _translate_to_english(result['member_since'])
+                if result['next_billing'] != 'N/A':
+                    result['next_billing'] = _translate_to_english(result['next_billing'])
+                if result['last_viewed'] != 'N/A' and result['last_viewed'] != 'Unable to fetch':
+                    result['last_viewed'] = _translate_to_english(result['last_viewed'])
+                if result['package'] != 'N/A':
+                    result['package'] = _translate_to_english(result['package'])                    
                 return result
     except Exception as e:
         logger.error(f"Error fetching account info: {e}")
