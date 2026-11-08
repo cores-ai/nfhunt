@@ -337,6 +337,13 @@ class Database:
         return [_deserialize_user(r) for r in rows] if rows else []
 
     @staticmethod
+    async def get_all_user_ids() -> list[int]:
+        rows = await Database.execute("SELECT user_id FROM users")
+        if rows:
+            return [int(r["user_id"]) for r in rows if r.get("user_id")]
+        return []
+
+    @staticmethod
     async def give_access(user_id: int, days: int, plan_name: str = "Premium") -> bool:
         user = await Database.get_user(user_id)
         if not user:

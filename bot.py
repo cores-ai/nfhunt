@@ -1,5 +1,7 @@
 import logging
 import sys
+import telegram
+import telegram.error
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
 import os
@@ -330,6 +332,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await Database.get_or_create_user(user_id, username, chat_type=chat_type)
         await Database.record_activity(user_id, chat_type=chat_type, increment_checks=1 if update.message.document else 0)
         
+        # Check if admin is sending a message for broadcast
+        if context.user_data.get('awaiting_broadcast_message') and is_admin(user_id):
+            if update.message.text and update.message.text.strip().lower() in ["/cancel", "cancel"]:
+                context.user_data.pop('awaiting_broadcast_message', None)
+                await update.message.reply_text("❌ Broadcast cancelled.")
+                return
+
+            context.user_data['awaiting_broadcast_message'] = False
+            context.user_data['pending_broadcast_msg_id'] = update.message.message_id
+            context.user_data['pending_broadcast_chat_id'] = update.effective_chat.id
+
+            target_count = len(await Database.get_all_user_ids())
+            preview_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"🚀 Send Broadcast to {target_count} Users", callback_data="broadcast:confirm")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="close_menu")]
+            ])
+            await update.message.reply_text(
+                f"📢 <b>Broadcast Ready!</b>\n\n"
+                f"Target: <code>{target_count}</code> registered users.\n\n"
+                f"Tap the button below to start sending or Cancel to abort.",
+                parse_mode='HTML',
+                reply_markup=preview_kb
+            )
+            return
+
         if update.message.document:
             await handle_file(update, context)
         elif update.message.text:
@@ -605,6 +632,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text == "/stats":
             if is_admin(user_id):
                 await stats_command(update, context)
+            return
+
+        if text.startswith(("/broadcast", "/roadcast", "/bcast")):
+            if is_admin(user_id):
+                await broadcast_command(update, context)
             return
 
         if text == "🎯 Valid Checker":
@@ -1149,13 +1181,59 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == 'admin_panel':
         if not is_admin(update.effective_user.id):
             return
-        text = "👑 <b>ADMIN PANEL</b>\n\nSelect an action below to manage users, plans, and live statistics:"
+        text = "👑 <b>ADMIN PANEL</b>\n\nSelect an action below to manage users, plans, broadcast, and live statistics:"
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("📊 Live Bot Stats", callback_data="stats:refresh")],
+            [InlineKeyboardButton("📢 Broadcast Message", callback_data="admin:broadcast")],
             [InlineKeyboardButton("💎 Grant Plan to User", callback_data="admin:grant")],
             [InlineKeyboardButton("❌ Close", callback_data="close_menu")]
         ])
         await query.message.reply_text(text, parse_mode='HTML', reply_markup=keyboard)
+        return
+
+    if data == 'admin:broadcast':
+        if not is_admin(update.effective_user.id):
+            return
+        context.user_data['awaiting_broadcast_message'] = True
+        await query.message.reply_text(
+            "📢 <b>BROADCAST MESSAGE MODE</b>\n\n"
+            "Please send the message you want to broadcast now.\n"
+            "• Supports: <b>Text (any font, style, bold, italic, links)</b>, <b>Photos with captions</b>, <b>Videos</b>, <b>Flyers</b>.\n"
+            "• Send /cancel to abort.",
+            parse_mode='HTML'
+        )
+        return
+
+    if data == 'broadcast:confirm':
+        if not is_admin(update.effective_user.id):
+            return
+        msg_id = context.user_data.pop('pending_broadcast_msg_id', None)
+        src_chat = context.user_data.pop('pending_broadcast_chat_id', None)
+        if not msg_id or not src_chat:
+            await query.answer("Broadcast expired or not found. Start again.", show_alert=True)
+            return
+
+        target_ids = await Database.get_all_user_ids()
+        status_msg = await query.edit_message_text(
+            f"🚀 <b>Starting broadcast to {len(target_ids)} users...</b>",
+            parse_mode='HTML'
+        )
+        
+        class DummyMsg:
+            def __init__(self, c_id, m_id):
+                self.chat_id = c_id
+                self.message_id = m_id
+                
+        src_obj = DummyMsg(src_chat, msg_id)
+        asyncio.create_task(
+            execute_broadcast(
+                context,
+                target_ids=target_ids,
+                source_message=src_obj,
+                status_msg=status_msg,
+                admin_chat_id=update.effective_chat.id
+            )
+        )
         return
         
     if data == 'admin:grant':
@@ -1751,13 +1829,180 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(user_id):
         return
         
-    text = "👑 <b>ADMIN PANEL</b>\n\nSelect an action below to manage users, plans, and live statistics:"
+    text = "👑 <b>ADMIN PANEL</b>\n\nSelect an action below to manage users, plans, broadcast, and live statistics:"
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Live Bot Stats", callback_data="stats:refresh")],
+        [InlineKeyboardButton("📢 Broadcast Message", callback_data="admin:broadcast")],
         [InlineKeyboardButton("💎 Grant Plan to User", callback_data="admin:grant")],
         [InlineKeyboardButton("❌ Close", callback_data="close_menu")]
     ])
     await update.message.reply_text(text, parse_mode='HTML', reply_markup=keyboard)
+
+async def execute_broadcast(context, target_ids: list[int], source_message=None, custom_html=None, custom_text=None, status_msg=None, admin_chat_id=None):
+    total = len(target_ids)
+    success = 0
+    blocked = 0
+    failed = 0
+    start_time = datetime.utcnow()
+
+    for idx, uid in enumerate(target_ids, 1):
+        try:
+            if source_message:
+                await context.bot.copy_message(
+                    chat_id=uid,
+                    from_chat_id=source_message.chat_id,
+                    message_id=source_message.message_id
+                )
+            elif custom_html:
+                try:
+                    await context.bot.send_message(
+                        chat_id=uid,
+                        text=custom_html,
+                        parse_mode='HTML',
+                        disable_web_page_preview=False
+                    )
+                except Exception:
+                    await context.bot.send_message(
+                        chat_id=uid,
+                        text=custom_text or custom_html,
+                        disable_web_page_preview=False
+                    )
+            elif custom_text:
+                await context.bot.send_message(
+                    chat_id=uid,
+                    text=custom_text,
+                    disable_web_page_preview=False
+                )
+            success += 1
+        except telegram.error.RetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+            try:
+                if source_message:
+                    await context.bot.copy_message(
+                        chat_id=uid,
+                        from_chat_id=source_message.chat_id,
+                        message_id=source_message.message_id
+                    )
+                elif custom_html:
+                    await context.bot.send_message(
+                        chat_id=uid,
+                        text=custom_html,
+                        parse_mode='HTML'
+                    )
+                success += 1
+            except Exception:
+                failed += 1
+        except (telegram.error.Forbidden, telegram.error.BadRequest) as e:
+            err_str = str(e).lower()
+            if "bot was blocked" in err_str or "user is deactivated" in err_str or "chat not found" in err_str:
+                blocked += 1
+            else:
+                failed += 1
+        except Exception:
+            failed += 1
+
+        await asyncio.sleep(0.04)
+
+        if status_msg and (idx % 25 == 0 or idx == total):
+            try:
+                elapsed = (datetime.utcnow() - start_time).total_seconds()
+                await status_msg.edit_text(
+                    f"📢 <b>Broadcasting in progress...</b>\n\n"
+                    f"Progress: <code>{idx}/{total}</code>\n"
+                    f"✅ Delivered: <code>{success}</code>\n"
+                    f"🚫 Blocked: <code>{blocked}</code>\n"
+                    f"⚠️ Failed: <code>{failed}</code>\n"
+                    f"⏱ Elapsed: <code>{elapsed:.1f}s</code>",
+                    parse_mode='HTML'
+                )
+            except Exception:
+                pass
+
+    elapsed = (datetime.utcnow() - start_time).total_seconds()
+    report = f"""╔══════════════════════════════╗
+║   📢 <b>BROADCAST COMPLETED!</b> 📢   ║
+╚══════════════════════════════╝
+
+👥 <b>Total Targeted:</b> <code>{total}</code>
+✅ <b>Successfully Delivered:</b> <code>{success}</code>
+🚫 <b>Blocked / Deactivated:</b> <code>{blocked}</code>
+⚠️ <b>Errors / Failed:</b> <code>{failed}</code>
+⏱ <b>Total Time Taken:</b> <code>{elapsed:.1f}s</code>"""
+
+    if status_msg:
+        try:
+            await status_msg.edit_text(report, parse_mode='HTML')
+            return
+        except Exception:
+            pass
+    if admin_chat_id:
+        try:
+            await context.bot.send_message(chat_id=admin_chat_id, text=report, parse_mode='HTML')
+        except Exception:
+            pass
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+
+    target_ids = await Database.get_all_user_ids()
+    if not target_ids:
+        await update.message.reply_text("❌ No users found in database to broadcast to.")
+        return
+
+    # Case 1: Admin replied to an existing message (photo, doc, custom text, audio, etc.)
+    if update.message.reply_to_message:
+        status_msg = await update.message.reply_text(
+            f"🚀 <b>Starting broadcast to {len(target_ids)} users...</b>",
+            parse_mode='HTML'
+        )
+        asyncio.create_task(
+            execute_broadcast(
+                context,
+                target_ids=target_ids,
+                source_message=update.message.reply_to_message,
+                status_msg=status_msg,
+                admin_chat_id=update.effective_chat.id
+            )
+        )
+        return
+
+    # Case 2: Command with message argument: /broadcast <message> or /roadcast <message>
+    raw_html = update.message.text_html or update.message.text or ""
+    content_html = re.sub(r"^/(?:broadcast|roadcast|bcast)\s+", "", raw_html, flags=re.IGNORECASE).strip()
+    content_raw = re.sub(r"^/(?:broadcast|roadcast|bcast)\s+", "", update.message.text or "", flags=re.IGNORECASE).strip()
+
+    if not content_raw:
+        usage = """📢 <b>Broadcast Command Usage:</b>
+
+1. <b>Direct Text with any font/format:</b>
+   <code>/broadcast Your promo message here 🔥</code>
+   (You can use bold, italic, custom fonts, emojis, links, etc.)
+
+2. <b>Reply to any message:</b>
+   Send any photo, video, text, sticker or flyer, then reply to it with:
+   <code>/broadcast</code> (or <code>/roadcast</code>)
+
+3. <b>Via Admin Panel:</b>
+   Use <b>👑 Admin Panel</b> ➡️ <b>📢 Broadcast Message</b>"""
+        await update.message.reply_text(usage, parse_mode='HTML')
+        return
+
+    status_msg = await update.message.reply_text(
+        f"🚀 <b>Starting broadcast to {len(target_ids)} users...</b>",
+        parse_mode='HTML'
+    )
+    asyncio.create_task(
+        execute_broadcast(
+            context,
+            target_ids=target_ids,
+            custom_html=content_html,
+            custom_text=content_raw,
+            status_msg=status_msg,
+            admin_chat_id=update.effective_chat.id
+        )
+    )
 
 
 
@@ -2117,6 +2362,7 @@ def main():
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CommandHandler(["broadcast", "roadcast", "bcast"], broadcast_command))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_message))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(on_button))
