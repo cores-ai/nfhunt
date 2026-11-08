@@ -3,7 +3,12 @@ import re
 from dotenv import load_dotenv, find_dotenv
 
 # Load environment variables from .env in project root if present (no override of existing env)
-load_dotenv(find_dotenv(), override=False)
+_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+if os.path.exists(_env_path):
+    load_dotenv(_env_path, override=False)
+else:
+    load_dotenv(find_dotenv(), override=False)
+
 
 def _read_token_from_env() -> str | None:
     # Support common env var names

@@ -385,7 +385,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle all incoming messages"""
     try:
         user_id = update.effective_user.id
-        await Database.update_last_active(user_id)
+        username = update.effective_user.username or update.effective_user.first_name or "User"
+        await Database.get_or_create_user(user_id, username)
         
         if update.message.document:
             await handle_file(update, context)
@@ -693,14 +694,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         elif text == "👤 Account":
             first_name = update.effective_user.first_name or "User"
+            username = update.effective_user.username or first_name
             user_data = await Database.get_user(user_id)
+            if not user_data:
+                user_data = await Database.get_or_create_user(user_id, username)
             is_prem = await is_premium_user(user_id)
             
-            db_plan = user_data.get('plan_name', 'Free')
+            db_plan = user_data.get('plan_name', 'Free') if user_data else 'Free'
             plan = f"💎 {db_plan}" if is_prem else f"🆓 {db_plan}"
             
             if is_prem:
-                validity = "♾️ Lifetime" if user_id == OWNER_ID else (user_data.get('unlimited_until', 'N/A').strftime('%Y-%m-%d') if user_data.get('unlimited_until') else "Unknown")
+                validity = "♾️ Lifetime" if user_id == OWNER_ID else (user_data.get('unlimited_until', 'N/A').strftime('%Y-%m-%d') if user_data and user_data.get('unlimited_until') else "Unknown")
                 limits = "♾️ Unlimited"
                 reset_timer = "N/A"
             else:
