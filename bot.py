@@ -219,83 +219,14 @@ def _details_look_valid(details: dict | None) -> bool:
     return False
 
 def _split_cookie_text_into_sets(content: str) -> list[dict]:
-    """Attempt to split a TXT content into multiple cookie sets.
-
-    Strategy:
-    - Split on blank lines into blocks
-    - Accept a block if parse_netflix_cookies finds cookies (prefer blocks containing NetflixId keys)
-    - If nothing splits meaningfully, return a single block
-    Returns a list of dicts: {name, content}
-    """
-    result = []
-    
-    # 1. Extract combos (whole lines)
-    combo_regex = re.compile(r'^.*?([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}:[^\s]+).*$', re.MULTILINE)
-    combos = combo_regex.findall(content)
-    
-    # We shouldn't remove combos from content if they contain cookies inline, 
-    # but the current logic splits on blank lines. We can just leave the content intact
-    # and let the block parser handle lines with inline cookies, because `parse_netflix_cookies`
-    # will find the cookies inside the combo line. But if there are no cookies, we want it 
-    # to be treated as a combo block.
-    # To be safe and support both multi-line combos and inline combos, we won't extract combos here
-    # and remove them. Instead, we let the block splitter do its job, and if a block is just a combo,
-    # the fallback in `process_cookies_unlimited` handles it.
-
-    # Convert common separators to blank lines for easier splitting
-    content = re.sub(r'^={3,}$', '\n\n', content, flags=re.MULTILINE)
-    content = re.sub(r'^-{3,}$', '\n\n', content, flags=re.MULTILINE)
-    content = re.sub(r'^\*{3,}$', '\n\n', content, flags=re.MULTILINE)
-    
-    # Ensure concatenated JSON arrays/objects are separated by blank lines
-    content = re.sub(r'\]\s*\[', ']\n\n[', content)
-    content = re.sub(r'\}\s*\{', '}\n\n{', content)
-
-    try:
-        blocks = re.split(r"\n\s*\n+", content.strip())
-    except Exception:
-        blocks = [content]
-
-    valid_blocks: list[str] = []
-    for blk in blocks:
-        if not blk or not blk.strip():
-            continue
-        parsed = parse_netflix_cookies(blk)
-        if parsed:
-            # prefer blocks that actually include netflix keys
-            names_lower = {c.get('name', '').lower() for c in parsed}
-            if any(k in names_lower for k in ['netflixid', 'securenetflixid', 'nflxwxn']):
-                valid_blocks.append(blk)
-            else:
-                # still accept generic cookie blocks
-                valid_blocks.append(blk)
-
-    if not valid_blocks:
-        if content.strip():
-            result.append({'name': 'TXT Content', 'content': content})
-        return result
-
-    # Merge tiny fragments: if we have many very small blocks and each has <2 pairs, join contiguous groups of 3
-    merged: list[str] = []
-    temp: list[str] = []
-    for blk in valid_blocks:
-        pairs = re.findall(r'([^=;\s]+)\s*=\s*([^;\n\r]+)', blk)
-        if len(pairs) < 2:
-            temp.append(blk)
-            if len(temp) >= 3:
-                merged.append('\n'.join(temp))
-                temp = []
-        else:
-            if temp:
-                merged.append('\n'.join(temp))
-                temp = []
-            merged.append(blk)
-    if temp:
-        merged.append('\n'.join(temp))
-
-    for idx, blk in enumerate(merged, start=len(result)+1):
-        result.append({'name': f'TXT part #{idx}', 'content': blk})
-    return result
+    """Split TXT content into multiple account items using the smart extractor."""
+    from archive_parser import extract_items_from_text
+    items = extract_items_from_text(content)
+    if len(items) > 1:
+        return [{'name': f'TXT part #{i}', 'content': it} for i, it in enumerate(items, 1)]
+    elif len(items) == 1:
+        return [{'name': 'TXT Content', 'content': items[0]}]
+    return [{'name': 'TXT Content', 'content': content}] if content.strip() else []
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
@@ -546,45 +477,21 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['pending_file_path'] = file_path
         context.user_data['pending_file_name'] = file_name
         
-        # Try to detect file contents
-        import zipfile
+        # Parse uploaded file recursively (supports nested ZIPs, RAR, TAR, multi-account TXT)
+        from archive_parser import parse_uploaded_file_to_cookies
         has_netflix = False
         cookies_data = []
         try:
-            if file_name.lower().endswith('.zip'):
-                with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                    for file_info in zip_ref.filelist:
-                        if not file_info.is_dir():
-                            try:
-                                with zip_ref.open(file_info) as cookie_file:
-                                    content = cookie_file.read().decode('utf-8', errors='ignore')
-                                    if content.strip():
-                                        parts = _split_cookie_text_into_sets(content)
-                                        if len(parts) > 1:
-                                            for idx, item in enumerate(parts, start=1):
-                                                cookies_data.append({'name': f"{file_info.filename} [#{idx}]", 'content': item['content']})
-                                        else:
-                                            cookies_data.append({'name': file_info.filename, 'content': content})
-                            except Exception:
-                                continue
-            elif file_name.lower().endswith('.txt'):
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read()
-                    if content.strip():
-                        parts = _split_cookie_text_into_sets(content)
-                        if len(parts) > 1:
-                            for idx, item in enumerate(parts, start=1):
-                                cookies_data.append({'name': f"{file_name} [#{idx}]", 'content': item['content']})
-                        else:
-                            cookies_data.append({'name': file_name, 'content': content})
-                            
+            cookies_data = parse_uploaded_file_to_cookies(file_path, file_name)
             if cookies_data:
-                sample_content = cookies_data[0]['content']
                 netflix_keywords = ['netflix.com', 'netflixid', 'securenetflixid', 'cookie', 'nftoken']
-                if any(kw in sample_content.lower() for kw in netflix_keywords) or sample_content.strip().startswith('[') or sample_content.strip().startswith('{'):
-                    has_netflix = True
-        except Exception:
-            pass
+                for item in cookies_data:
+                    c_str = item.get('content', '').lower()
+                    if any(kw in c_str for kw in netflix_keywords) or c_str.strip().startswith('[') or c_str.strip().startswith('{'):
+                        has_netflix = True
+                        break
+        except Exception as e:
+            logger.error("Error parsing uploaded file: %s", e)
             
         if has_netflix:
             context.user_data['check_mode'] = 'extract'
@@ -1371,34 +1278,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_path = context.user_data.get('pending_file_path')
         file_name = context.user_data.get('pending_file_name')
         
-        cookies_data = []
-        import zipfile
-        if file_name.lower().endswith('.zip'):
-            with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                for file_info in zip_ref.filelist:
-                    if not file_info.is_dir():
-                        try:
-                            with zip_ref.open(file_info) as cookie_file:
-                                content = cookie_file.read().decode('utf-8', errors='ignore')
-                                if content.strip():
-                                    parts = _split_cookie_text_into_sets(content)
-                                    if len(parts) > 1:
-                                        for idx, item in enumerate(parts, start=1):
-                                            cookies_data.append({'name': f"{file_info.filename} [#{idx}]", 'content': item['content']})
-                                    else:
-                                        cookies_data.append({'name': file_info.filename, 'content': content})
-                        except Exception:
-                            continue
-        elif file_name.lower().endswith('.txt'):
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-                if content.strip():
-                    parts = _split_cookie_text_into_sets(content)
-                    if len(parts) > 1:
-                        for idx, item in enumerate(parts, start=1):
-                            cookies_data.append({'name': f"{file_name} [#{idx}]", 'content': item['content']})
-                    else:
-                        cookies_data.append({'name': file_name, 'content': content})
+        from archive_parser import parse_uploaded_file_to_cookies
+        cookies_data = parse_uploaded_file_to_cookies(file_path, file_name)
                         
         _trigger_batch(update, context, cookies_data)
         return
