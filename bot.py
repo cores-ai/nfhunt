@@ -92,10 +92,13 @@ def _cleanup_artifacts(aggressive: bool = False) -> None:
         pass
 
 def parse_netflix_cookies(content):
-    """Parse Netflix cookies from various formats safely"""
-    cookies = []
+    """Parse Netflix cookies from various formats safely."""
+    if not content or not isinstance(content, str):
+        return []
     
-    # 1. Try JSON Array extraction (handles leading/trailing text)
+    cookies = []
+
+    # 1. JSON Array extraction
     try:
         start_idx = content.find('[')
         end_idx = content.rfind(']')
@@ -111,87 +114,90 @@ def parse_netflix_cookies(content):
                     path = item.get('path') or item.get('Path') or '/'
                     if name and value:
                         cookies.append({
-                            'name': str(name),
-                            'value': str(value),
-                            'domain': str(domain),
-                            'path': str(path),
+                            'name': str(name).strip(),
+                            'value': str(value).strip(),
+                            'domain': str(domain).strip(),
+                            'path': str(path).strip(),
                             'secure': True,
                             'httpOnly': True
                         })
+            if any(c['name'].lower() in ['netflixid', 'securenetflixid'] for c in cookies):
+                return cookies
     except Exception:
         pass
 
-    if cookies: return cookies
-
-    # 2. Try generic name=value extraction
+    # 2. Netscape format (standard 7 columns or tab/space separated)
+    netscape_cookies = []
     try:
-        # If it's a combo string ending with NetflixCookies=..., isolate that part
-        match = re.search(r'NetflixCookies=(.*)', content)
-        target_content = match.group(1) if match else content
-        
-        pairs = re.findall(r'([^=;\s\|]+)\s*=\s*([^;\n\r\|]+)', target_content)
-        if pairs:
-            names_lower = {n.lower() for n, _ in pairs}
-            has_netflix_keys = any(k in names_lower for k in ['netflixid', 'securenetflixid']) or any('netflix' in n for n in names_lower)
-            if has_netflix_keys:
-                for name, value in pairs:
-                    if name and value:
-                        cookies.append({
-                            'name': name.strip(),
-                            'value': value.strip().strip('"'),
-                            'domain': '.netflix.com',
-                            'path': '/',
-                            'secure': True,
-                            'httpOnly': True
+        for line in content.splitlines():
+            line_clean = line.strip()
+            if not line_clean or line_clean.startswith('#'):
+                continue
+            if 'netflix.com' in line_clean or line_clean.startswith('.'):
+                parts = line_clean.split('\t') if '\t' in line_clean else line_clean.split()
+                if len(parts) >= 7:
+                    domain, flag, path, secure, http_only, name, value = parts[:7]
+                    name_clean = name.strip()
+                    if re.match(r'^[a-zA-Z0-9_\-\.]+$', name_clean) and not name_clean.startswith('http'):
+                        netscape_cookies.append({
+                            'name': name_clean,
+                            'value': value.strip(),
+                            'domain': domain.strip(),
+                            'path': path.strip(),
+                            'secure': str(secure).lower() in ['true', '1'],
+                            'httpOnly': str(http_only).lower() in ['true', '1']
                         })
+        if any(c['name'].lower() in ['netflixid', 'securenetflixid'] for c in netscape_cookies):
+            return netscape_cookies
     except Exception:
         pass
 
-    if cookies: return cookies
-
-    # 3. Handle lines starting with Cookie: header
+    # 3. Cookie header lines (Cookie: NetflixId=...; SecureNetflixId=...)
+    header_cookies = []
     try:
-        for line in content.split('\n'):
-            if line.lower().startswith('cookie:'):
-                header = line.split(':', 1)[1]
+        for line in content.splitlines():
+            line_s = line.strip()
+            if line_s.lower().startswith('cookie:'):
+                header = line_s.split(':', 1)[1]
                 for pair in header.split(';'):
                     if '=' in pair:
-                        name, value = pair.split('=', 1)
-                        if name.strip() and value.strip():
-                            cookies.append({
-                                'name': name.strip(),
-                                'value': value.strip(),
+                        k, v = pair.split('=', 1)
+                        k_s, v_s = k.strip(), v.strip()
+                        if k_s and v_s and re.match(r'^[a-zA-Z0-9_\-\.]+$', k_s) and not k_s.startswith('http'):
+                            header_cookies.append({
+                                'name': k_s,
+                                'value': v_s,
                                 'domain': '.netflix.com',
                                 'path': '/',
                                 'secure': True,
                                 'httpOnly': True
                             })
+        if any(c['name'].lower() in ['netflixid', 'securenetflixid'] for c in header_cookies):
+            return header_cookies
     except Exception:
         pass
 
-    if cookies: return cookies
-
-    # 4. Fallback: Parse Netscape format
+    # 4. Specific Netflix Key=Value pairs
+    kv_cookies = []
     try:
-        lines = content.split('\n')
-        for line in lines:
-            line = line.strip()
-            if line and not line.startswith('#') and 'netflix.com' in line:
-                parts = line.split('\t') if '\t' in line else line.split()
-                if len(parts) >= 7:
-                    domain, _, path, secure, http_only, name, value = parts[:7]
-                    cookies.append({
-                        'name': name,
-                        'value': value,
-                        'domain': domain,
-                        'path': path,
-                        'secure': str(secure).lower() == 'true',
-                        'httpOnly': str(http_only).lower() == 'true'
-                    })
-    except Exception as e:
-        logger.error(f"Error parsing netscape cookies: {e}")
-        
-    return cookies
+        for m in re.finditer(r'(?:^|[\s;\r\n])(?P<key>NetflixId|SecureNetflixId|nfvdid|flwssn|optimizelyEndUserId)\s*=\s*(?P<val>[^\s;\r\n]+)', content, re.IGNORECASE):
+            k = m.group('key').strip()
+            v = m.group('val').strip().strip('"').strip(';')
+            if k and v:
+                kv_cookies.append({
+                    'name': k,
+                    'value': v,
+                    'domain': '.netflix.com',
+                    'path': '/',
+                    'secure': True,
+                    'httpOnly': True
+                })
+        if any(c['name'].lower() in ['netflixid', 'securenetflixid'] for c in kv_cookies):
+            return kv_cookies
+    except Exception:
+        pass
+
+    return []
 
 async def _delete_later(path: str, delay_seconds: int = 60) -> None:
     try:
@@ -1428,7 +1434,34 @@ async def start_batch_processing(update: Update, context: ContextTypes.DEFAULT_T
             return
 
         cookies = parse_netflix_cookies(cookie_data['content'])
+        direct_link = None
+
         if not cookies:
+            token_m = re.search(r'nftoken=([a-zA-Z0-9%_\-+=/]+)', cookie_data['content'], re.IGNORECASE)
+            if token_m:
+                token_val = token_m.group(1).strip()
+                direct_link = f"https://www.netflix.com/youraccount?nftoken={token_val}"
+                try:
+                    import aiohttp, ssl
+                    ssl_ctx = ssl.create_default_context()
+                    ssl_ctx.check_hostname = False
+                    ssl_ctx.verify_mode = ssl.CERT_NONE
+                    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
+                    async with aiohttp.ClientSession() as sess:
+                        async with sess.get(direct_link, headers=headers, ssl=ssl_ctx, allow_redirects=False) as resp:
+                            for c in sess.cookie_jar:
+                                cookies.append({
+                                    'name': c.key,
+                                    'value': c.value,
+                                    'domain': getattr(c, 'domain', None) or '.netflix.com',
+                                    'path': getattr(c, 'path', None) or '/',
+                                    'secure': True,
+                                    'httpOnly': True
+                                })
+                except Exception as ex:
+                    logger.debug(f"Direct token resolution error: {ex}")
+
+        if not cookies and not direct_link:
             invalid_items.append({'name': cookie_data['name'], 'content': cookie_data['content']})
             return
 
@@ -1447,8 +1480,9 @@ async def start_batch_processing(update: Update, context: ContextTypes.DEFAULT_T
                         return
 
                 # 1. Generate Link Instantly (Fast API Logic)
-                logger.info("🔍 API: Generating direct login link...")
-                direct_link = await scraper.generate_direct_login_link_api(cookies)
+                if not direct_link:
+                    logger.info("🔍 API: Generating direct login link...")
+                    direct_link = await scraper.generate_direct_login_link_api(cookies)
                 
                 if direct_link in ["COOKIES_EXPIRED", "NO_NFTOKEN_FOUND", "ERROR", "BROWSER_ERROR", "N/A"]:
                     enhanced_check = await scraper.fetch_enhanced_account_details(cookies)

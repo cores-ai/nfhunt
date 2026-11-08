@@ -1,6 +1,6 @@
-python-telegram-bot==22.8
-python-dotenv==1.0.0
-playwright==1.61.0
+python-telegram-bot
+python-dotenv
+playwright
 requests
 deep-translator
 aiohttp

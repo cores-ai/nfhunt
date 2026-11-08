@@ -98,14 +98,14 @@ def extract_items_from_text(content: str) -> list[str]:
     - 'Valid Cookie' delimiter blocks
     - JSON Array of cookies (single or concatenated)
     - Netscape cookie blocks with multiple accounts
-    - Single account text files
+    - Single account text files (preserves metadata, combo, direct links, Netscape cookies together)
     - Line-by-line combos and standalone tokens
     """
     content = content.replace("\r\n", "\n").replace("\r", "\n").strip()
     if not content:
         return []
 
-    # 1. JSON Array of cookies
+    # 1. Single JSON Array of cookies
     if content.startswith("[") and content.endswith("]"):
         try:
             parsed = json.loads(content)
@@ -114,12 +114,14 @@ def extract_items_from_text(content: str) -> list[str]:
         except Exception:
             pass
 
-    # Concatenated JSON arrays (e.g. ][ or ]\n[)
+    # 2. Concatenated JSON arrays (e.g. ][ or ]\s*\[)
     if "][" in content or re.search(r"\]\s*\[", content):
         parts = re.split(r"\]\s*\[", content)
         json_blocks = []
-        for i, p in enumerate(parts):
-            chunk = p
+        for chunk in parts:
+            chunk = chunk.strip()
+            if not chunk:
+                continue
             if not chunk.startswith("["):
                 chunk = "[" + chunk
             if not chunk.endswith("]"):
@@ -131,22 +133,6 @@ def extract_items_from_text(content: str) -> list[str]:
                 pass
         if len(json_blocks) >= 2:
             return deduplicate_items(json_blocks)
-
-    # 2. "Valid Cookie" delimiter format
-    if "Valid Cookie" in content:
-        raw_blocks = content.split("Valid Cookie")
-        items = []
-        for b in raw_blocks:
-            b_str = b.strip()
-            if not b_str:
-                continue
-            if "nftoken=" in b_str and not ("\t" in b_str or "NetflixId=" in b_str):
-                match = re.search(r"https?://[^\s]*netflix\.com[^\s]*nftoken=[^\s]+|https?://[^\s]*nftoken=[^\s]+", b_str)
-                items.append(match.group(0).strip() if match else b_str)
-            else:
-                items.append("Valid Cookie\n\n" + b_str if not b_str.startswith("Valid Cookie") else b_str)
-        if items:
-            return deduplicate_items(items)
 
     # 3. Checker Hit logs / multi-account result formats (HIT NO.1, ACCOUNT NO.1)
     hit_pat = re.compile(
@@ -170,7 +156,23 @@ def extract_items_from_text(content: str) -> list[str]:
         if len(blocks) >= 2:
             return deduplicate_items(blocks)
 
-    # 4. Repeating Account Details: blocks
+    # 4. Repeating "Valid Cookie" delimiter format
+    if content.count("Valid Cookie") >= 2:
+        raw_blocks = content.split("Valid Cookie")
+        items = []
+        for b in raw_blocks:
+            b_str = b.strip()
+            if not b_str:
+                continue
+            if "nftoken=" in b_str and not ("\t" in b_str or "NetflixId=" in b_str):
+                match = re.search(r"https?://[^\s]*netflix\.com[^\s]*nftoken=[^\s]+|https?://[^\s]*nftoken=[^\s]+", b_str)
+                items.append(match.group(0).strip() if match else b_str)
+            else:
+                items.append("Valid Cookie\n\n" + b_str if not b_str.startswith("Valid Cookie") else b_str)
+        if len(items) >= 2:
+            return deduplicate_items(items)
+
+    # 5. Repeating Account Details: blocks
     acc_pat = re.compile(r"(?mi)^[ \t]*(?:[━=\-]{4,}\s*\n)?[ \t]*(?:👤\s*)?Account\s+Details:\s*$", re.MULTILINE)
     indices = [m.start() for m in acc_pat.finditer(content)]
     if len(indices) >= 2:
@@ -188,52 +190,21 @@ def extract_items_from_text(content: str) -> list[str]:
         if len(blocks) >= 2:
             return deduplicate_items(blocks)
 
-    # 5. Direct Watch / Login Link separated blocks
-    token_pat = re.compile(
-        r"(?mi)^[ \t]*(?:Direct\s+Watch|Phone\s+Login|PC\s+Login|TV\s+Activation|Token\s+Link|Token):\s*https?://",
-        re.MULTILINE,
-    )
-    indices = [m.start() for m in token_pat.finditer(content)]
-    if len(indices) >= 2 and "netflixid" not in content.lower():
-        blocks = []
-        nftoken_regex = re.compile(r"(https?://[^\s]*netflix\.com[^\s]*nftoken=[^\s]+|https?://[^\s]*nftoken=[^\s]+)")
-        for line in content.splitlines():
-            m = nftoken_regex.search(line)
-            if m:
-                blocks.append(m.group(1))
-        if blocks:
-            return deduplicate_items(blocks)
-
-    # 6. Multi-dash horizontal separators between accounts
-    if re.search(r"\n[━=\-]{8,}\n", content):
-        blocks = [b.strip() for b in re.split(r"\n[━=\-]{8,}\n", content) if b.strip()]
-        valid_blocks = [
-            b for b in blocks
-            if ("netflixid" in b.lower() or "nftoken=" in b.lower() or "securenetflixid" in b.lower())
-        ]
-        if len(valid_blocks) >= 2:
-            return deduplicate_items(valid_blocks)
-
-    # 7. Check if predominantly Netscape cookie format
+    # 6. Netscape cookie check
     lines = content.splitlines()
-    netscape_lines = [
-        line_str for line_str in lines
-        if ("\t" in line_str or "TRUE\t" in line_str or "FALSE\t" in line_str) and not line_str.startswith("#")
-    ]
-    valid_non_comment = [line_str for line_str in lines if line_str.strip() and not line_str.strip().startswith("#")]
-
-    if netscape_lines and len(netscape_lines) >= max(2, len(valid_non_comment) * 0.4):
-        # Check if file contains MULTIPLE accounts
-        netflixid_count = sum(
-            1 for line_str in lines
-            if any(k in line_str.lower() for k in ["netflixid\t", "netflixid ", "securenetflixid\t", "securenetflixid "])
-        )
-        if netflixid_count > 1:
+    has_netscape = any(
+        ("\t" in l or "TRUE\t" in l or "FALSE\t" in l or ".netflix.com" in l) and not l.strip().startswith("#")
+        for l in lines
+    )
+    if has_netscape:
+        # Count distinct accounts by counting NetflixId lines
+        nid_count = sum(1 for l in lines if re.search(r'(?:\t|\s|^)netflixid(?:\t|\s|=)', l, re.IGNORECASE))
+        if nid_count > 1:
             accounts = []
             curr_acc = []
-            for line_str in lines:
-                s = line_str.strip()
-                is_header = s.startswith(("# Netscape", "# HTTP Cookie File", "===", "---"))
+            for l in lines:
+                s = l.strip()
+                is_header = s.startswith(("# Netscape", "# HTTP Cookie File", "===", "---", "━━━"))
                 if not s:
                     if curr_acc and any("netflixid" in line_item.lower() for line_item in curr_acc):
                         accounts.append("\n".join(curr_acc))
@@ -247,65 +218,41 @@ def extract_items_from_text(content: str) -> list[str]:
                 accounts.append("\n".join(curr_acc))
             if len(accounts) >= 2:
                 return deduplicate_items(accounts)
-        return [content]
+        elif nid_count == 1 or any("netflixid" in l.lower() for l in lines):
+            # Exactly 1 account with Netscape cookies (even if accompanied by direct link, combo, promo)
+            return [content]
 
-    # 8. Fallback: Line-by-line combo & token extraction
-    items = []
-    current_cookie_lines = []
+    # 7. Multi-dash horizontal separators between distinct accounts
+    # ONLY split if multiple blocks EACH contain an actual Netflix session or combo
+    if re.search(r"\n[━=\-]{8,}\n", content):
+        blocks = [b.strip() for b in re.split(r"\n[━=\-]{8,}\n", content) if b.strip()]
+        valid_blocks = [
+            b for b in blocks
+            if ("netflixid" in b.lower() or "nftoken=" in b.lower() or "securenetflixid" in b.lower())
+        ]
+        if len(valid_blocks) >= 2:
+            return deduplicate_items(valid_blocks)
+
+    # 8. Check for multiple standalone nftoken URLs (one per line, without cookies)
     nftoken_regex = re.compile(r"(https?://[^\s]*netflix\.com[^\s]*nftoken=[^\s]+|https?://[^\s]*nftoken=[^\s]+)")
+    token_urls = []
+    for l in lines:
+        m = nftoken_regex.search(l)
+        if m and "netflixid" not in l.lower():
+            token_urls.append(m.group(1))
+    if len(token_urls) >= 2 and not any("netflixid" in l.lower() for l in lines):
+        return deduplicate_items(token_urls)
 
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            if current_cookie_lines:
-                items.append("\n".join(current_cookie_lines))
-                current_cookie_lines = []
-            continue
+    # 9. Check for combo list (email:password)
+    combo_lines = []
+    for l in lines:
+        c = parse_combo_line(l)
+        if c:
+            combo_lines.append(c)
+    if len(combo_lines) >= 2 and not any("netflixid" in l.lower() for l in lines):
+        return deduplicate_items(combo_lines)
 
-        if re.match(r"^[-=*#]{3,}$", stripped):
-            if current_cookie_lines:
-                items.append("\n".join(current_cookie_lines))
-                current_cookie_lines = []
-            continue
-
-        has_session = (
-            "netflixid=" in stripped.lower()
-            or "securenetflixid=" in stripped.lower()
-            or "cookies =" in stripped.lower()
-            or "nftoken=" in stripped.lower()
-        )
-        if has_session:
-            if current_cookie_lines:
-                items.append("\n".join(current_cookie_lines))
-                current_cookie_lines = []
-            items.append(stripped)
-            continue
-
-        parsed_combo = parse_combo_line(stripped)
-        if parsed_combo:
-            if current_cookie_lines:
-                items.append("\n".join(current_cookie_lines))
-                current_cookie_lines = []
-            items.append(parsed_combo)
-            continue
-
-        token_match = nftoken_regex.search(stripped)
-        if token_match:
-            if current_cookie_lines:
-                items.append("\n".join(current_cookie_lines))
-                current_cookie_lines = []
-            items.append(token_match.group(1))
-            continue
-
-        if ("\t" in stripped and (".netflix.com" in stripped or "TRUE" in stripped or "FALSE" in stripped)) or "netflixid=" in stripped.lower() or "securenetflixid=" in stripped.lower():
-            current_cookie_lines.append(stripped)
-
-    if current_cookie_lines:
-        items.append("\n".join(current_cookie_lines))
-
-    if items:
-        return deduplicate_items(items)
-
+    # Default: The text is a single account item!
     return [content]
 
 def _decode_bytes_to_text(b: bytes) -> str | None:
