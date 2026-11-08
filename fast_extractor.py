@@ -1,7 +1,10 @@
-import re
-import json
 import html
+import json
+import re
 import unicodedata
+import contextlib
+
+
 def _decode_unicode_escape(match):
     try:
         return chr(int(match.group(1), 16))
@@ -41,14 +44,13 @@ def decode_netflix_value(value):
     # Some scraped values arrive split like "Est u00E1ndar" -> "Est ándar".
     cleaned = re.sub(r"(?<=[A-Za-z])\s+(?=[^\x00-\x7F])", "", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    
+
     # Fix surrogate pairs (like emojis) that break python-telegram-bot
-    try:
-        cleaned = cleaned.encode('utf-16', 'surrogatepass').decode('utf-16')
-    except Exception:
-        pass
-        
+    with contextlib.suppress(Exception):
+        cleaned = cleaned.encode("utf-16", "surrogatepass").decode("utf-16")
+
     return cleaned or None
+
 
 def normalize_phone_number(value, country_code=None):
     cleaned = decode_netflix_value(value)
@@ -149,7 +151,7 @@ def extract_profile_names(response_text):
             if decoded and decoded not in names:
                 names.append(decoded)
     for match in re.finditer(r'"__typename"\s*:\s*"Profile"', response_text):
-        snippet = response_text[match.start():match.start() + 1200]
+        snippet = response_text[match.start() : match.start() + 1200]
         name_match = re.search(r'"name"\s*:\s*"([^"]+)"', snippet)
         if name_match:
             decoded = decode_netflix_value(name_match.group(1))
@@ -196,8 +198,8 @@ def extract_info_from_graphql_payload(response_text):
 
     growth_account = data.get("growthAccount") or {}
     current_profile = data.get("currentProfile") or {}
-    current_plan = ((growth_account.get("currentPlan") or {}).get("plan") or {})
-    next_plan = ((growth_account.get("nextPlan") or {}).get("plan") or {})
+    current_plan = (growth_account.get("currentPlan") or {}).get("plan") or {}
+    next_plan = (growth_account.get("nextPlan") or {}).get("plan") or {}
     next_billing = growth_account.get("nextBillingDate") or {}
     hold_meta = growth_account.get("growthHoldMetadata") or {}
     local_phone = growth_account.get("growthLocalizablePhoneNumber") or {}
@@ -213,7 +215,9 @@ def extract_info_from_graphql_payload(response_text):
     phone_country_code = None
     if isinstance(raw_phone, dict):
         phone_digits_obj = raw_phone.get("phoneNumberDigits") or {}
-        phone_digits = phone_digits_obj.get("value") if isinstance(phone_digits_obj, dict) else raw_phone.get("phoneNumberDigits")
+        phone_digits = (
+            phone_digits_obj.get("value") if isinstance(phone_digits_obj, dict) else raw_phone.get("phoneNumberDigits")
+        )
         phone_verified_graphql = raw_phone.get("isVerified")
         phone_country_code = raw_phone.get("countryCode")
     else:
@@ -243,7 +247,7 @@ def extract_info_from_graphql_payload(response_text):
 
     feature_types = []
     for plan_obj in (current_plan, next_plan):
-        for feature in (plan_obj.get("availableFeatures") or []):
+        for feature in plan_obj.get("availableFeatures") or []:
             if isinstance(feature, dict) and feature.get("type"):
                 feature_types.append(str(feature["type"]).upper())
 
@@ -292,7 +296,7 @@ def extract_info_from_graphql_payload(response_text):
     info = {
         "accountOwnerName": decode_netflix_value(current_profile.get("name")),
         "email": decode_netflix_value(email_value),
-        "countryOfSignup": decode_netflix_value(((growth_account.get("countryOfSignUp") or {}).get("code"))),
+        "countryOfSignup": decode_netflix_value((growth_account.get("countryOfSignUp") or {}).get("code")),
         "memberSince": decode_netflix_value(growth_account.get("memberSince")),
         "nextBillingDate": decode_netflix_value(next_billing.get("localDate") or next_billing.get("date")),
         "userGuid": decode_netflix_value(growth_account.get("ownerGuid") or current_profile.get("guid")),
@@ -320,9 +324,8 @@ def extract_info_from_graphql_payload(response_text):
     elif payment_display_text and payment_logo is None and not re.fullmatch(r"\d{4}", payment_display_text):
         info["paymentMethodType"] = info["paymentMethodType"] or payment_display_text
 
-    if not info["paymentMethodType"] and payment_methods:
-        if "Card" in payment_typename:
-            info["paymentMethodType"] = "CC"
+    if not info["paymentMethodType"] and payment_methods and "Card" in payment_typename:
+        info["paymentMethodType"] = "CC"
 
     return {key: value for key, value in info.items() if value not in (None, "", [], {})}
 
@@ -338,8 +341,7 @@ def extract_info(response_text):
         r"ekstra\s+uye\s+bir\s+baskasinin\s+planinda",
     )
     extra_member_by_response_text = any(
-        re.search(pattern, response_text, re.IGNORECASE)
-        for pattern in extra_member_account_patterns
+        re.search(pattern, response_text, re.IGNORECASE) for pattern in extra_member_account_patterns
     )
     if has_complete_account_info(graphql_info):
         # Fast path: GraphQL payload already has core account fields.
@@ -371,12 +373,15 @@ def extract_info(response_text):
                     r'"countryOfSignup":\s*"([^"]+)"',
                 ],
             ),
-            "memberSince": extract_first_match(response_text, [
-                r'"memberSince":\s*"([^"]+)"',
-                r'data-uia="account-overview-page\+membership-card\+plan-banner"[^>]*>([^<]+)</div>',
-                r'Assinante desde\s*([^<]+)',
-                r'Member since\s*([^<]+)',
-            ]),
+            "memberSince": extract_first_match(
+                response_text,
+                [
+                    r'"memberSince":\s*"([^"]+)"',
+                    r'data-uia="account-overview-page\+membership-card\+plan-banner"[^>]*>([^<]+)</div>',
+                    r"Assinante desde\s*([^<]+)",
+                    r"Member since\s*([^<]+)",
+                ],
+            ),
             "nextBillingDate": extract_first_match(
                 response_text,
                 [
@@ -398,7 +403,7 @@ def extract_info(response_text):
             "maxStreams": extract_first_match(
                 response_text,
                 [
-                    r'maxStreams\":\{\"fieldType\":\"Numeric\",\"value\":([^,]+),',
+                    r"maxStreams\":\{\"fieldType\":\"Numeric\",\"value\":([^,]+),",
                     r'"maxStreams"\s*:\s*"?([^",}]+)"?',
                 ],
             ),
@@ -532,15 +537,20 @@ def extract_info(response_text):
     if not extracted["paymentMethodType"]:
         extracted["paymentMethodType"] = extracted["paymentMethodExists"]
 
-    if extracted["maskedCard"] and re.fullmatch(r"\d{4}", extracted["maskedCard"]):
-        if extracted.get("paymentMethodType") in {None, "", "Yes"}:
-            extracted["paymentMethodType"] = "CC"
+    if (
+        extracted["maskedCard"]
+        and re.fullmatch(r"\d{4}", extracted["maskedCard"])
+        and extracted.get("paymentMethodType") in {None, "", "Yes"}
+    ):
+        extracted["paymentMethodType"] = "CC"
 
     if extracted["holdStatus"] is None:
         membership_status_key = normalize_plan_key(extracted.get("membershipStatus"))
         if membership_status_key == "current_member":
             extracted["holdStatus"] = "No"
-        elif any(token in membership_status_key for token in ("hold", "past_due", "payment_retry", "paused", "suspend")):
+        elif any(
+            token in membership_status_key for token in ("hold", "past_due", "payment_retry", "paused", "suspend")
+        ):
             extracted["holdStatus"] = "Yes"
 
     if extracted["emailVerified"] is None and extracted.get("email"):
@@ -560,9 +570,10 @@ def extract_info(response_text):
 
     return translate_to_english(extracted)
 
+
 def extract_security_info(response_text):
     info = {}
-    
+
     # Extract Email
     email_block = re.search(
         r'data-uia="account-security-page\+account-details-card\+email-button(?:\+item\+label)?".*?(?:</button>|</a>|</li>)',
@@ -572,145 +583,256 @@ def extract_security_info(response_text):
     if email_block:
         block_text = email_block.group(0)
         email_match = re.search(
-            r'<p[^>]*>\s*([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})\s*</p>',
+            r"<p[^>]*>\s*([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})\s*</p>",
             block_text,
             re.IGNORECASE,
         )
         if email_match:
-            info['email'] = email_match.group(1).strip()
+            info["email"] = email_match.group(1).strip()
 
-    if 'email' not in info:
+    if "email" not in info:
         email_match = re.search(
             r'data-uia="account-security-page\+account-details-card\+email-button[^\"]*"[^>]*>.*?([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})',
             response_text,
             re.DOTALL | re.IGNORECASE,
         )
         if email_match:
-            info['email'] = email_match.group(1).strip()
-        
+            info["email"] = email_match.group(1).strip()
+
     # Extract Email Verified Status
-    email_block = re.search(r'data-uia="account-security-page\+account-details-card\+email-button\+item\+label".*?(?:</li>|</button>|</a>)', response_text, re.DOTALL | re.IGNORECASE)
+    email_block = re.search(
+        r'data-uia="account-security-page\+account-details-card\+email-button\+item\+label".*?(?:</li>|</button>|</a>)',
+        response_text,
+        re.DOTALL | re.IGNORECASE,
+    )
     if email_block:
         block_text = email_block.group(0).lower()
-        if 'circleexclamationpoint' in block_text or 'requer verifi' in block_text or 'unverified' in block_text or 'verify your' in block_text or 'needs verification' in block_text:
-            info['emailVerified'] = 'No'
+        if (
+            "circleexclamationpoint" in block_text
+            or "requer verifi" in block_text
+            or "unverified" in block_text
+            or "verify your" in block_text
+            or "needs verification" in block_text
+        ):
+            info["emailVerified"] = "No"
         else:
-            info['emailVerified'] = 'Yes'
+            info["emailVerified"] = "Yes"
 
     # Extract Phone
-    phone_match = re.search(r'data-uia="account-security-page\+account-details-card\+phone\+item\+label"[^>]*>.*?</div>\s*<p[^>]*>([^<]+)</p>', response_text, re.DOTALL)
+    phone_match = re.search(
+        r'data-uia="account-security-page\+account-details-card\+phone\+item\+label"[^>]*>.*?</div>\s*<p[^>]*>([^<]+)</p>',
+        response_text,
+        re.DOTALL,
+    )
     if phone_match:
-        info['phoneNumber'] = phone_match.group(1).strip()
-        
+        info["phoneNumber"] = phone_match.group(1).strip()
+
     # Extract Phone Verified Status
-    phone_block = re.search(r'data-uia="account-security-page\+account-details-card\+phone\+item\+label".*?(?:</li>|</button>|</a>)', response_text, re.DOTALL)
+    phone_block = re.search(
+        r'data-uia="account-security-page\+account-details-card\+phone\+item\+label".*?(?:</li>|</button>|</a>)',
+        response_text,
+        re.DOTALL,
+    )
     if phone_block:
         block_text = phone_block.group(0).lower()
-        if 'circleexclamationpoint' in block_text or 'requer verifi' in block_text or 'unverified' in block_text or 'verify your' in block_text or 'banner+verifyphone' in response_text.lower() or 'needs verification' in block_text:
-            info['phoneVerified'] = 'No'
+        if (
+            "circleexclamationpoint" in block_text
+            or "requer verifi" in block_text
+            or "unverified" in block_text
+            or "verify your" in block_text
+            or "banner+verifyphone" in response_text.lower()
+            or "needs verification" in block_text
+        ):
+            info["phoneVerified"] = "No"
         else:
-            info['phoneVerified'] = 'Yes'
-            
+            info["phoneVerified"] = "Yes"
+
     return {k: v for k, v in info.items() if v}
+
 
 def extract_profiles_info(response_text):
     info = {}
-    
+
     # Extract profiles from aria-label or specific data-uia label divs
-    profile_matches = re.findall(r'<button[^>]*aria-label="([^"]+)"[^>]*data-cl-view="accountProfileSettings"', response_text)
-    
+    profile_matches = re.findall(
+        r'<button[^>]*aria-label="([^"]+)"[^>]*data-cl-view="accountProfileSettings"', response_text
+    )
+
     # Powerful fallback: extract from the text inside the label div
     if not profile_matches:
-        profile_matches = re.findall(r'data-uia="menu-card\+account-profiles-page\+profiles-menu-card\+[^"]+\+item\+label"[^>]*>([^<]+)</div>', response_text)
-        
+        profile_matches = re.findall(
+            r'data-uia="menu-card\+account-profiles-page\+profiles-menu-card\+[^"]+\+item\+label"[^>]*>([^<]+)</div>',
+            response_text,
+        )
+
     if not profile_matches:
-        profile_matches = re.findall(r'data-uia="menu-card\+account-profiles-page\+profiles-menu-card\+([^+"]+)(?:\+item)?"', response_text)
-    
+        profile_matches = re.findall(
+            r'data-uia="menu-card\+account-profiles-page\+profiles-menu-card\+([^+"]+)(?:\+item)?"', response_text
+        )
+
     # Deduplicate while preserving order
     unique_profiles = []
     for p in profile_matches:
         cleaned = p.strip()
         if cleaned and cleaned not in unique_profiles:
             unique_profiles.append(cleaned)
-            
+
     if unique_profiles:
-        info['profiles'] = ", ".join(unique_profiles)
-        info['profileCount'] = len(unique_profiles)
-        info['profilesDisplay'] = info['profiles']
-        
+        info["profiles"] = ", ".join(unique_profiles)
+        info["profileCount"] = len(unique_profiles)
+        info["profilesDisplay"] = info["profiles"]
+
     # Extract Extra Members if present
     # Looking for extra members section or similar text
     extra_member_patterns = [
-        r'assinante\s+extra', r'suscriptor\s+extra', r'extra\s+member', 
-        r'abbonato\s+extra', r'abonn[ée]\s+suppl[ée]mentaire'
+        r"assinante\s+extra",
+        r"suscriptor\s+extra",
+        r"extra\s+member",
+        r"abbonato\s+extra",
+        r"abonn[ée]\s+suppl[ée]mentaire",
     ]
     if any(re.search(pattern, response_text, re.IGNORECASE) for pattern in extra_member_patterns):
-        info['isExtraMemberAccount'] = 'Yes'
-        
+        info["isExtraMemberAccount"] = "Yes"
+
     return info
+
 
 def translate_date_to_english(date_str):
     if not date_str:
         return date_str
-        
+
     date_str = str(date_str).lower()
-    
-    prefixes = ['próximo pagamento:', 'proximo pago:', 'next billing date:', 'next payment:', 'pagamento:', 'pago:']
+
+    prefixes = ["próximo pagamento:", "proximo pago:", "next billing date:", "next payment:", "pagamento:", "pago:"]
     for p in prefixes:
         if date_str.startswith(p):
-            date_str = date_str.replace(p, '').strip()
-            
+            date_str = date_str.replace(p, "").strip()
+
     months_map = {
-        'january': 'January', 'janeiro': 'January', 'janvier': 'January', 'enero': 'January', 'jan': 'January',
-        'february': 'February', 'fevereiro': 'February', 'février': 'February', 'febrero': 'February', 'feb': 'February',
-        'march': 'March', 'março': 'March', 'mars': 'March', 'marzo': 'March', 'mar': 'March',
-        'april': 'April', 'abril': 'April', 'avril': 'April', 'apr': 'April',
-        'may': 'May', 'maio': 'May', 'mai': 'May', 'mayo': 'May',
-        'june': 'June', 'junho': 'June', 'juin': 'June', 'junio': 'June', 'jun': 'June',
-        'july': 'July', 'julho': 'July', 'juillet': 'July', 'julio': 'July', 'jul': 'July',
-        'august': 'August', 'agosto': 'August', 'août': 'August', 'aug': 'August',
-        'september': 'September', 'setembro': 'September', 'septembre': 'September', 'septiembre': 'September', 'sep': 'September',
-        'october': 'October', 'outubro': 'October', 'octobre': 'October', 'octubre': 'October', 'oct': 'October',
-        'november': 'November', 'novembro': 'November', 'novembre': 'November', 'nov': 'November',
-        'december': 'December', 'dezembro': 'December', 'décembre': 'December', 'diciembre': 'December', 'dec': 'December'
+        "january": "January",
+        "janeiro": "January",
+        "janvier": "January",
+        "enero": "January",
+        "jan": "January",
+        "february": "February",
+        "fevereiro": "February",
+        "février": "February",
+        "febrero": "February",
+        "feb": "February",
+        "march": "March",
+        "março": "March",
+        "mars": "March",
+        "marzo": "March",
+        "mar": "March",
+        "april": "April",
+        "abril": "April",
+        "avril": "April",
+        "apr": "April",
+        "may": "May",
+        "maio": "May",
+        "mai": "May",
+        "mayo": "May",
+        "june": "June",
+        "junho": "June",
+        "juin": "June",
+        "junio": "June",
+        "jun": "June",
+        "july": "July",
+        "julho": "July",
+        "juillet": "July",
+        "julio": "July",
+        "jul": "July",
+        "august": "August",
+        "agosto": "August",
+        "août": "August",
+        "aug": "August",
+        "september": "September",
+        "setembro": "September",
+        "septembre": "September",
+        "septiembre": "September",
+        "sep": "September",
+        "october": "October",
+        "outubro": "October",
+        "octobre": "October",
+        "octubre": "October",
+        "oct": "October",
+        "november": "November",
+        "novembro": "November",
+        "novembre": "November",
+        "nov": "November",
+        "december": "December",
+        "dezembro": "December",
+        "décembre": "December",
+        "diciembre": "December",
+        "dec": "December",
     }
-    
+
     month_keys = sorted(months_map.keys(), key=len, reverse=True)
-    pattern = r'(' + '|'.join(month_keys) + r')'
-    
+    pattern = r"(" + "|".join(month_keys) + r")"
+
     month_match = re.search(pattern, date_str, re.IGNORECASE)
-    year_match = re.search(r'(\d{4})', date_str)
-    day_match = re.search(r'\b(\d{1,2})\b(?!\d{2})', date_str)
-    
+    year_match = re.search(r"(\d{4})", date_str)
+    day_match = re.search(r"\b(\d{1,2})\b(?!\d{2})", date_str)
+
     if month_match and year_match:
         eng_month = months_map[month_match.group(1).lower()]
         year = year_match.group(1)
         if day_match:
-            return f'{eng_month} {day_match.group(1)}, {year}'
-        else:
-            return f'{eng_month} {year}'
-            
+            return f"{eng_month} {day_match.group(1)}, {year}"
+        return f"{eng_month} {year}"
+
     return date_str.title()
 
+
 def country_code_to_flag(country_code):
-    if not country_code: return ""
+    if not country_code:
+        return ""
     upper = country_code.upper()
     if len(upper) == 2 and upper.isalpha():
         return "".join(chr(127397 + ord(char)) for char in upper)
     return ""
 
+
 def get_full_country_name(code):
     mapping = {
-        "US": "United States", "BR": "Brazil", "IN": "India", "GB": "United Kingdom",
-        "PH": "Philippines", "CA": "Canada", "AU": "Australia", "DE": "Germany",
-        "FR": "France", "IT": "Italy", "ES": "Spain", "MX": "Mexico", "AR": "Argentina",
-        "CO": "Colombia", "CL": "Chile", "PE": "Peru", "JP": "Japan", "KR": "South Korea",
-        "ID": "Indonesia", "MY": "Malaysia", "SG": "Singapore", "TH": "Thailand",
-        "VN": "Vietnam", "AE": "United Arab Emirates", "SA": "Saudi Arabia", "TR": "Turkey",
-        "ZA": "South Africa", "NL": "Netherlands", "SE": "Sweden", "CH": "Switzerland",
-        "PL": "Poland", "RO": "Romania", "GR": "Greece", "PT": "Portugal", "IE": "Ireland"
+        "US": "United States",
+        "BR": "Brazil",
+        "IN": "India",
+        "GB": "United Kingdom",
+        "PH": "Philippines",
+        "CA": "Canada",
+        "AU": "Australia",
+        "DE": "Germany",
+        "FR": "France",
+        "IT": "Italy",
+        "ES": "Spain",
+        "MX": "Mexico",
+        "AR": "Argentina",
+        "CO": "Colombia",
+        "CL": "Chile",
+        "PE": "Peru",
+        "JP": "Japan",
+        "KR": "South Korea",
+        "ID": "Indonesia",
+        "MY": "Malaysia",
+        "SG": "Singapore",
+        "TH": "Thailand",
+        "VN": "Vietnam",
+        "AE": "United Arab Emirates",
+        "SA": "Saudi Arabia",
+        "TR": "Turkey",
+        "ZA": "South Africa",
+        "NL": "Netherlands",
+        "SE": "Sweden",
+        "CH": "Switzerland",
+        "PL": "Poland",
+        "RO": "Romania",
+        "GR": "Greece",
+        "PT": "Portugal",
+        "IE": "Ireland",
     }
     return mapping.get(code.upper(), code.upper())
+
 
 def translate_to_english(extracted_info):
     country = extracted_info.get("countryOfSignup")
@@ -735,16 +857,16 @@ def translate_to_english(extracted_info):
             extracted_info["localizedPlanName"] = "Basic"
         elif "mobile" in plan_key or "movil" in plan_key:
             extracted_info["localizedPlanName"] = "Mobile"
-            
+
     # Translate dates
     member_since = extracted_info.get("memberSince")
     if member_since:
         extracted_info["memberSince"] = translate_date_to_english(member_since)
-        
+
     next_billing = extracted_info.get("nextBillingDate")
     if next_billing:
         extracted_info["nextBillingDate"] = translate_date_to_english(next_billing)
-            
+
     status = extracted_info.get("membershipStatus")
     if status:
         status_key = normalize_plan_key(status)
@@ -756,6 +878,7 @@ def translate_to_english(extracted_info):
             extracted_info["membershipStatus"] = "Active"
 
     return extracted_info
+
 
 def normalize_plan_key(plan_name):
     if not plan_name:
@@ -771,5 +894,3 @@ def format_plan_label(plan_key):
         return "Unknown"
     label = plan_key.replace("_", " ").strip()
     return label.title() if label else "Unknown"
-
-

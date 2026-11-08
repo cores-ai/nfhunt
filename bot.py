@@ -202,17 +202,19 @@ async def _delete_later(path: str, delay_seconds: int = 60) -> None:
         pass
 
 def _details_look_valid(details: dict | None) -> bool:
-    """Heuristic to decide if scraping succeeded.
-    Treat as valid if any strong field is present, not just email.
+    """Heuristic to decide if cookie or account is valid.
+    Treat as valid if any strong field is present and status is not DEAD.
     """
     if not isinstance(details, dict):
         return False
+    if details.get("error") in ["no_cookies", "login_redirect", "expired"] or details.get("status") == "DEAD":
+        return False
     strong_keys = [
-        'email', 'plan', 'member_since', 'package', 'profile_name', 'service_code', 'profiles_count', 'language'
+        'email', 'plan', 'member_since', 'package', 'profile_name', 'service_code', 'profiles_count', 'language', 'membership_status', 'country'
     ]
     for key in strong_keys:
         val = details.get(key)
-        if isinstance(val, str) and val.strip() and val.strip() != 'N/A':
+        if isinstance(val, str) and val.strip() and val.strip().lower() not in ('n/a', 'unknown', 'none', ''):
             return True
     return False
 
@@ -995,6 +997,11 @@ async def process_cookies_unlimited(update, context, cookies_data, processing_ms
                         direct_link = await scraper.generate_direct_login_link_api(cookies)
                     
                     if direct_link in ["COOKIES_EXPIRED", "NO_NFTOKEN_FOUND", "ERROR", "BROWSER_ERROR", "N/A"]:
+                        # Fallback 1: Double check account page directly via enhanced details
+                        enhanced_check = await scraper.fetch_enhanced_account_details(cookies)
+                        if enhanced_check and _details_look_valid(enhanced_check) and not enhanced_check.get("error") and enhanced_check.get("status") != "DEAD":
+                            logger.info("✅ Cookie is valid via account page check!")
+                            direct_link = "N/A (Import Cookies via Cookie-Editor)"
                         # Fallback to combo if available
                         if combo_match:
                             import combo_checker
@@ -1562,14 +1569,19 @@ async def start_batch_processing(update: Update, context: ContextTypes.DEFAULT_T
                 logger.info("🔍 API: Generating direct login link...")
                 direct_link = await scraper.generate_direct_login_link_api(cookies)
                 
-                if direct_link == "COOKIES_EXPIRED":
-                    await _send_result_to_user("❌ *COOKIES EXPIRED*\n\nThe cookies you provided are invalid or expired. Please get fresh cookies from an active Netflix session.")
-                    invalid_items.append({'name': cookie_data['name'], 'content': cookie_data['content']})
-                    return
-                elif direct_link in ["NO_NFTOKEN_FOUND", "ERROR", "BROWSER_ERROR", "N/A"]:
-                    await _send_result_to_user("❌ *NO NFToken FOUND*\n\nCould not extract a working nftoken from the cookies. The cookies may be valid but don't contain a usable nftoken for direct login.")
-                    invalid_items.append({'name': cookie_data['name'], 'content': cookie_data['content']})
-                    return
+                if direct_link in ["COOKIES_EXPIRED", "NO_NFTOKEN_FOUND", "ERROR", "BROWSER_ERROR", "N/A"]:
+                    enhanced_check = await scraper.fetch_enhanced_account_details(cookies)
+                    if enhanced_check and _details_look_valid(enhanced_check) and not enhanced_check.get("error") and enhanced_check.get("status") != "DEAD":
+                        logger.info("✅ Cookie confirmed valid via account page fallback")
+                        direct_link = "N/A (Import Cookies via Cookie-Editor)"
+                    elif direct_link == "COOKIES_EXPIRED" or (enhanced_check and enhanced_check.get("status") == "DEAD"):
+                        await _send_result_to_user("❌ *COOKIES EXPIRED*\n\nThe cookies you provided are invalid or expired. Please get fresh cookies from an active Netflix session.")
+                        invalid_items.append({'name': cookie_data['name'], 'content': cookie_data['content']})
+                        return
+                    else:
+                        await _send_result_to_user("❌ *NO NFToken FOUND*\n\nCould not extract a working nftoken from the cookies. The cookies may be valid but don't contain a usable nftoken for direct login.")
+                        invalid_items.append({'name': cookie_data['name'], 'content': cookie_data['content']})
+                        return
                 
                 # Setup initial details
                 initial_details = {
@@ -1875,7 +1887,13 @@ async def start_filter_processing(update, context, start: int, controller_msg_id
         async with api_semaphore:
             try:
                 direct_link = await scraper.generate_direct_login_link_api(cookies)
-                if direct_link in ["COOKIES_EXPIRED", "NO_NFTOKEN_FOUND", "ERROR", "BROWSER_ERROR", "N/A"]:
+                is_valid = direct_link and str(direct_link).startswith("http")
+                if not is_valid:
+                    enhanced_check = await scraper.fetch_enhanced_account_details(cookies)
+                    if enhanced_check and _details_look_valid(enhanced_check) and not enhanced_check.get("error") and enhanced_check.get("status") != "DEAD":
+                        is_valid = True
+                
+                if not is_valid:
                     invalid_files.append((cookie_data['name'], raw_content))
                 else:
                     user_id = getattr(update.effective_user, 'id', 0)

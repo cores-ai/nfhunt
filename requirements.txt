@@ -4,3 +4,4 @@ playwright==1.61.0
 requests
 deep-translator
 aiohttp
+curl_cffi
