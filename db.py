@@ -1,106 +1,191 @@
 import asyncio
+import logging
 from datetime import datetime, timedelta
-import motor.motor_asyncio
-from config import MONGO_URI
+import aiohttp
+from config import CF_ACCOUNT_ID, CF_D1_DATABASE_ID, CF_API_TOKEN
+
+logger = logging.getLogger(__name__)
+
+def _parse_dt(val) -> datetime | None:
+    if not val:
+        return None
+    if isinstance(val, datetime):
+        return val
+    try:
+        return datetime.fromisoformat(val)
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(val, fmt)
+        except Exception:
+            pass
+    return None
+
+def _deserialize_user(row: dict | None) -> dict | None:
+    if not row:
+        return None
+    data = dict(row)
+    data["created_at"] = _parse_dt(data.get("created_at"))
+    data["last_active"] = _parse_dt(data.get("last_active"))
+    data["unlimited_until"] = _parse_dt(data.get("unlimited_until"))
+    data["last_reset_time"] = _parse_dt(data.get("last_reset_time"))
+    return data
 
 class Database:
-    client = None
-    db = None
-    users_collection = None
+    _session: aiohttp.ClientSession | None = None
+    _initialized: bool = False
+    _lock = asyncio.Lock()
 
     @classmethod
-    def get_collection(cls):
-        if cls.users_collection is None:
-            # Initialize inside the event loop lazily
-            cls.client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
-            cls.db = cls.client.netflix_bot
-            cls.users_collection = cls.db.users
-        return cls.users_collection
+    async def get_session(cls) -> aiohttp.ClientSession:
+        if cls._session is None or cls._session.closed:
+            cls._session = aiohttp.ClientSession()
+        return cls._session
+
+    @classmethod
+    async def close(cls):
+        if cls._session and not cls._session.closed:
+            await cls._session.close()
+
+    @classmethod
+    async def ensure_initialized(cls):
+        if cls._initialized:
+            return
+        async with cls._lock:
+            if cls._initialized:
+                return
+            await cls._init_table()
+            cls._initialized = True
+
+    @classmethod
+    async def _init_table(cls):
+        create_sql = """
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            referral_count INTEGER DEFAULT 0,
+            referred_by INTEGER,
+            plan_name TEXT DEFAULT 'Free',
+            unlimited_until TEXT,
+            created_at TEXT,
+            last_active TEXT,
+            daily_valid_finds INTEGER DEFAULT 0,
+            last_reset_time TEXT
+        );
+        """
+        await cls.raw_execute(create_sql)
+
+    @classmethod
+    async def raw_execute(cls, sql: str, params: list | None = None) -> list[dict]:
+        if not CF_ACCOUNT_ID or not CF_D1_DATABASE_ID or not CF_API_TOKEN or "PASTE_YOUR" in CF_API_TOKEN:
+            logger.error("Cloudflare D1 credentials missing in .env")
+            return []
+
+        session = await cls.get_session()
+        url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/d1/database/{CF_D1_DATABASE_ID}/query"
+        headers = {
+            "Authorization": f"Bearer {CF_API_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "sql": sql,
+            "params": params or []
+        }
+
+        try:
+            async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                data = await resp.json()
+                if not data.get("success"):
+                    logger.error("Cloudflare D1 Error: %s", data.get("errors"))
+                    return []
+                result = data.get("result", [])
+                if result and isinstance(result, list):
+                    return result[0].get("results", [])
+                return []
+        except Exception as e:
+            logger.error("Cloudflare D1 request exception: %s", e)
+            return []
+
+    @classmethod
+    async def execute(cls, sql: str, params: list | None = None) -> list[dict]:
+        await cls.ensure_initialized()
+        return await cls.raw_execute(sql, params)
 
     @staticmethod
     async def get_user(user_id: int):
-        return await Database.get_collection().find_one({"user_id": user_id})
+        rows = await Database.execute("SELECT * FROM users WHERE user_id = ?", [user_id])
+        if rows:
+            return _deserialize_user(rows[0])
+        return None
 
     @staticmethod
     async def get_or_create_user(user_id: int, username: str, referrer_id: int = None):
-        coll = Database.get_collection()
-        user = await coll.find_one({"user_id": user_id})
+        user = await Database.get_user(user_id)
         if not user:
-            user = {
-                "user_id": user_id,
-                "username": username,
-                "referral_count": 0,
-                "referred_by": referrer_id,
-                "plan_name": "Free",
-                "unlimited_until": None,
-                "created_at": datetime.utcnow(),
-                "last_active": datetime.utcnow(),
-                "daily_valid_finds": 0,
-                "last_reset_time": datetime.utcnow()
-            }
-            await coll.insert_one(user)
-            
+            now_iso = datetime.utcnow().isoformat()
+            await Database.execute(
+                """
+                INSERT OR IGNORE INTO users (
+                    user_id, username, referral_count, referred_by, plan_name,
+                    unlimited_until, created_at, last_active, daily_valid_finds, last_reset_time
+                ) VALUES (?, ?, 0, ?, 'Free', NULL, ?, ?, 0, ?)
+                """,
+                [user_id, username, referrer_id, now_iso, now_iso, now_iso]
+            )
+
             # Process referral bonus for referrer
             if referrer_id and referrer_id != user_id:
                 await Database.process_referral(referrer_id)
         else:
             await Database.update_last_active(user_id)
-            updates = {}
-            if "daily_valid_finds" not in user:
-                updates["daily_valid_finds"] = 0
-                updates["last_reset_time"] = datetime.utcnow()
-            if "plan_name" not in user:
-                updates["plan_name"] = "Free"
-            if updates:
-                await coll.update_one({"user_id": user_id}, {"$set": updates})
-                
-        return await coll.find_one({"user_id": user_id})
+
+        return await Database.get_user(user_id)
 
     @staticmethod
     async def process_referral(referrer_id: int):
-        coll = Database.get_collection()
-        referrer = await coll.find_one({"user_id": referrer_id})
-        if referrer:
-            new_count = referrer.get("referral_count", 0) + 1
-            await coll.update_one({"user_id": referrer_id}, {"$set": {"referral_count": new_count}})
+        await Database.execute(
+            "UPDATE users SET referral_count = referral_count + 1 WHERE user_id = ?",
+            [referrer_id]
+        )
 
     @staticmethod
     async def get_remaining_limit(user_id: int) -> int:
         """Returns the number of remaining limits, or -1 if unlimited."""
-        coll = Database.get_collection()
-        user = await coll.find_one({"user_id": user_id})
+        user = await Database.get_user(user_id)
         if not user:
             return 0
-            
+
         unlimited_until = user.get("unlimited_until")
         if unlimited_until:
             if unlimited_until > datetime.utcnow():
-                return -1 # Represents unlimited
+                return -1  # Represents unlimited
             else:
                 # Plan expired! Revert to Free.
-                await coll.update_one(
-                    {"user_id": user_id}, 
-                    {"$set": {"plan_name": "Free", "unlimited_until": None}}
+                await Database.execute(
+                    "UPDATE users SET plan_name = 'Free', unlimited_until = NULL WHERE user_id = ?",
+                    [user_id]
                 )
-            
-        last_reset = user.get("last_reset_time", datetime.min)
+
+        last_reset = user.get("last_reset_time") or datetime.min
         if datetime.utcnow() - last_reset > timedelta(hours=24):
-            await coll.update_one(
-                {"user_id": user_id},
-                {"$set": {"daily_valid_finds": 0, "last_reset_time": datetime.utcnow()}}
+            now_iso = datetime.utcnow().isoformat()
+            await Database.execute(
+                "UPDATE users SET daily_valid_finds = 0, last_reset_time = ? WHERE user_id = ?",
+                [now_iso, user_id]
             )
             user["daily_valid_finds"] = 0
-            
+
         max_limit = 10 + (user.get("referral_count", 0) * 10)
         daily_finds = user.get("daily_valid_finds", 0)
         return max(0, max_limit - daily_finds)
 
     @staticmethod
     async def get_time_until_reset(user_id: int) -> str:
-        coll = Database.get_collection()
-        user = await coll.find_one({"user_id": user_id})
-        if not user: return "0h 0m"
-        last_reset = user.get("last_reset_time", datetime.utcnow())
+        user = await Database.get_user(user_id)
+        if not user:
+            return "0h 0m"
+        last_reset = user.get("last_reset_time") or datetime.utcnow()
         reset_time = last_reset + timedelta(hours=24)
         time_left = reset_time - datetime.utcnow()
         if time_left.total_seconds() <= 0:
@@ -112,16 +197,18 @@ class Database:
     @staticmethod
     async def decrement_batch_limit(user_id: int, count: int):
         """Increments daily_valid_finds by count if not unlimited."""
-        coll = Database.get_collection()
-        user = await coll.find_one({"user_id": user_id})
+        user = await Database.get_user(user_id)
         if not user:
             return
-            
+
         unlimited_until = user.get("unlimited_until")
         if unlimited_until and unlimited_until > datetime.utcnow():
-            return # Unlimited
-            
-        await coll.update_one({"user_id": user_id}, {"$inc": {"daily_valid_finds": count}})
+            return  # Unlimited
+
+        await Database.execute(
+            "UPDATE users SET daily_valid_finds = daily_valid_finds + ? WHERE user_id = ?",
+            [count, user_id]
+        )
 
     @staticmethod
     async def check_limit(user_id: int) -> bool:
@@ -132,24 +219,14 @@ class Database:
     @staticmethod
     async def decrement_limit(user_id: int):
         """Increments daily_valid_finds by 1 if not unlimited."""
-        coll = Database.get_collection()
-        user = await coll.find_one({"user_id": user_id})
-        if not user:
-            return
-            
-        unlimited_until = user.get("unlimited_until")
-        if unlimited_until and unlimited_until > datetime.utcnow():
-            return # Unlimited
-            
-        await coll.update_one({"user_id": user_id}, {"$inc": {"daily_valid_finds": 1}})
+        await Database.decrement_batch_limit(user_id, 1)
 
     @staticmethod
     async def get_referral_info(user_id: int):
-        coll = Database.get_collection()
-        user = await coll.find_one({"user_id": user_id})
+        user = await Database.get_user(user_id)
         if not user:
             return {"count": 0, "limit": 0, "unlimited_until": None}
-            
+
         rem = await Database.get_remaining_limit(user_id)
         return {
             "count": user.get("referral_count", 0),
@@ -159,23 +236,26 @@ class Database:
 
     @staticmethod
     async def update_last_active(user_id: int):
-        coll = Database.get_collection()
-        await coll.update_one(
-            {"user_id": user_id},
-            {"$set": {"last_active": datetime.utcnow()}}
+        now_iso = datetime.utcnow().isoformat()
+        await Database.execute(
+            "UPDATE users SET last_active = ? WHERE user_id = ?",
+            [now_iso, user_id]
         )
 
     @staticmethod
     async def get_stats() -> dict:
-        coll = Database.get_collection()
         now = datetime.utcnow()
-        week_ago = now - timedelta(days=7)
-        month_ago = now - timedelta(days=30)
-        
-        total_users = await coll.count_documents({})
-        weekly_active = await coll.count_documents({"last_active": {"$gte": week_ago}})
-        monthly_active = await coll.count_documents({"last_active": {"$gte": month_ago}})
-        
+        week_ago_iso = (now - timedelta(days=7)).isoformat()
+        month_ago_iso = (now - timedelta(days=30)).isoformat()
+
+        total_res = await Database.execute("SELECT COUNT(*) as total FROM users")
+        weekly_res = await Database.execute("SELECT COUNT(*) as total FROM users WHERE last_active >= ?", [week_ago_iso])
+        monthly_res = await Database.execute("SELECT COUNT(*) as total FROM users WHERE last_active >= ?", [month_ago_iso])
+
+        total_users = total_res[0]["total"] if total_res else 0
+        weekly_active = weekly_res[0]["total"] if weekly_res else 0
+        monthly_active = monthly_res[0]["total"] if monthly_res else 0
+
         return {
             "total_users": total_users,
             "weekly_active": weekly_active,
@@ -184,17 +264,13 @@ class Database:
 
     @staticmethod
     async def give_access(user_id: int, days: int, plan_name: str = "Premium") -> bool:
-        coll = Database.get_collection()
-        user = await coll.find_one({"user_id": user_id})
+        user = await Database.get_user(user_id)
         if not user:
             return False
-            
+
         unlimited_until = datetime.utcnow() + timedelta(days=days)
-        await coll.update_one(
-            {"user_id": user_id},
-            {"$set": {
-                "unlimited_until": unlimited_until,
-                "plan_name": plan_name
-            }}
+        await Database.execute(
+            "UPDATE users SET unlimited_until = ?, plan_name = ? WHERE user_id = ?",
+            [unlimited_until.isoformat(), plan_name, user_id]
         )
         return True

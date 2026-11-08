@@ -29,24 +29,9 @@ if not _token:
     )
 
 BOT_TOKEN: str = _validate_token_or_raise(_token)
-
-import urllib.parse
-
-def _get_mongo_uri() -> str:
-    uri = os.getenv("MONGO_URI", "")
-    if uri and "://" in uri:
-        try:
-            scheme, rest = uri.split("://", 1)
-            if "@" in rest:
-                credentials, cluster = rest.rsplit("@", 1)
-                if ":" in credentials:
-                    user, pwd = credentials.split(":", 1)
-                    user = urllib.parse.quote_plus(urllib.parse.unquote_plus(user))
-                    pwd = urllib.parse.quote_plus(urllib.parse.unquote_plus(pwd))
-                    uri = f"{scheme}://{user}:{pwd}@{cluster}"
-        except Exception:
-            pass
-    return uri
-
-MONGO_URI: str = _get_mongo_uri()
 OWNER_ID: int = int(os.getenv("OWNER_ID", "7562427494"))
+
+# Cloudflare D1 Database Configuration
+CF_ACCOUNT_ID: str = os.getenv("CF_ACCOUNT_ID", "").strip()
+CF_D1_DATABASE_ID: str = os.getenv("CF_D1_DATABASE_ID", "").strip()
+CF_API_TOKEN: str = os.getenv("CF_API_TOKEN", "").strip()
