@@ -24,7 +24,7 @@ if sys.platform.startswith('win'):
 # Set concurrency limit (Max simultaneous checks to avoid API bans)
 CONCURRENCY_LIMIT = 20
 api_semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
-from config import BOT_TOKEN, OWNER_ID
+from config import BOT_TOKEN, OWNER_ID, ADMIN_IDS, is_admin
 from db import Database
 
 # Configure logging - LIVE DEBUG MODE
@@ -243,10 +243,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args and context.args[0].isdigit():
         referrer_id = int(context.args[0])
         
-    await Database.get_or_create_user(user_id, username, referrer_id)
-    await Database.update_last_active(user_id)
+    chat_type = update.effective_chat.type if update.effective_chat else "private"
+    await Database.get_or_create_user(user_id, username, referrer_id, chat_type=chat_type)
+    await Database.record_activity(user_id, chat_type=chat_type)
     
-    if user_id == OWNER_ID:
+    if is_admin(user_id):
         welcome_text = """🎬 <b>Netflix Cookie Bot - Direct Login Edition</b>
 
 👑 <b>Welcome Boss! You have UNLIMITED access.</b>
@@ -297,7 +298,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [KeyboardButton("📋 Plans", style="success"), KeyboardButton("🎁 Refer", style="success")]
     ]
     
-    if user_id == OWNER_ID:
+    if is_admin(user_id):
         reply_buttons.append([KeyboardButton("💎 Premium", style="primary"), KeyboardButton("👑 Admin Panel", style="primary")])
     else:
         reply_buttons.append([KeyboardButton("💎 Premium", style="primary")])
@@ -325,7 +326,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user_id = update.effective_user.id
         username = update.effective_user.username or update.effective_user.first_name or "User"
-        await Database.get_or_create_user(user_id, username)
+        chat_type = update.effective_chat.type if update.effective_chat else "private"
+        await Database.get_or_create_user(user_id, username, chat_type=chat_type)
+        await Database.record_activity(user_id, chat_type=chat_type, increment_checks=1 if update.message.document else 0)
         
         if update.message.document:
             await handle_file(update, context)
@@ -594,9 +597,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Select plan to grant to User `{target_id}`:", parse_mode='Markdown', reply_markup=kb)
             return
 
-        if text == "👑 Admin Panel":
-            if user_id == OWNER_ID:
+        if text in ["👑 Admin Panel", "/admin"]:
+            if is_admin(user_id):
                 await admin_command(update, context)
+            return
+
+        if text == "/stats":
+            if is_admin(user_id):
+                await stats_command(update, context)
             return
 
         if text == "🎯 Valid Checker":
@@ -1085,33 +1093,80 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data or ''
     user_data = context.user_data
 
+    # Record user activity on any button click
+    try:
+        chat_type = update.effective_chat.type if update.effective_chat else 'private'
+        user_id = query.from_user.id
+        username = query.from_user.username or query.from_user.first_name or "User"
+        await Database.get_or_create_user(user_id, username, chat_type=chat_type)
+        await Database.record_activity(user_id, chat_type=chat_type)
+    except Exception:
+        pass
+
     if data == 'close_menu':
         try:
             await query.message.delete()
         except Exception:
             pass
         return
+
+    if data == 'stats:refresh':
+        if not is_admin(update.effective_user.id):
+            return
+        stats = await Database.get_stats()
+        text = format_stats_html(stats)
+        try:
+            await query.edit_message_text(text, parse_mode='HTML', reply_markup=get_stats_keyboard())
+            await query.answer("Stats updated! ⚡")
+        except Exception:
+            await query.answer("Stats are already up to date!")
+        return
+
+    if data == 'stats:recent':
+        if not is_admin(update.effective_user.id):
+            return
+        recent = await Database.get_recent_users(limit=10)
+        lines = ["<b>👥 RECENT ACTIVE DM USERS (Last 10)</b>\n"]
+        if not recent:
+            lines.append("<i>No recent activity found.</i>")
+        else:
+            for idx, u in enumerate(recent, 1):
+                uid = u.get("user_id")
+                uname = u.get("username") or "Unknown"
+                plan = u.get("plan_name", "Free")
+                chat = u.get("chat_type", "private")
+                last_act = u.get("last_active")
+                time_str = last_act.strftime("%m-%d %H:%M") if hasattr(last_act, "strftime") else str(last_act)[:16]
+                lines.append(f"<b>{idx}.</b> <code>{uid}</code> | @{uname} | 💎 <b>{plan}</b> | 💬 <code>{chat}</code> | 🕒 <code>{time_str}</code>")
+        text = "\n".join(lines)
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 Back to Stats", callback_data="stats:refresh")],
+            [InlineKeyboardButton("❌ Close", callback_data="close_menu")]
+        ])
+        await query.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+        return
         
     if data == 'admin_panel':
-        if update.effective_user.id != OWNER_ID:
+        if not is_admin(update.effective_user.id):
             return
-        text = "👑 *ADMIN PANEL*\n\nSelect an action below to manage users and plans:"
+        text = "👑 <b>ADMIN PANEL</b>\n\nSelect an action below to manage users, plans, and live statistics:"
         keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📊 Live Bot Stats", callback_data="stats:refresh")],
             [InlineKeyboardButton("💎 Grant Plan to User", callback_data="admin:grant")],
             [InlineKeyboardButton("❌ Close", callback_data="close_menu")]
         ])
-        await query.message.reply_text(text, parse_mode='Markdown', reply_markup=keyboard)
+        await query.message.reply_text(text, parse_mode='HTML', reply_markup=keyboard)
         return
         
     if data == 'admin:grant':
-        if update.effective_user.id != OWNER_ID:
+        if not is_admin(update.effective_user.id):
             return
         await query.message.reply_text("Please reply to this message with the *User ID* you want to grant a plan to:", parse_mode='Markdown')
         context.user_data['awaiting_user_id_for_plan'] = True
         return
         
     if data.startswith('admin:grant_plan:'):
-        if update.effective_user.id != OWNER_ID:
+        if not is_admin(update.effective_user.id):
             return
         days = int(data.split(':')[2])
         target_id = context.user_data.get('target_plan_user_id')
@@ -1632,31 +1687,77 @@ async def start_batch_processing(update: Update, context: ContextTypes.DEFAULT_T
     # Light cleanup of artifacts after finishing a batch
     _cleanup_artifacts(aggressive=False)
 
+def format_stats_html(s: dict) -> str:
+    total = s.get("total_users", 0)
+    dm = s.get("dm_users", 0)
+    group = s.get("group_users", 0)
+    dm_pct = f"{(dm / total * 100):.1f}%" if total else "0%"
+    grp_pct = f"{(group / total * 100):.1f}%" if total else "0%"
+    
+    prem = s.get("premium_users", 0)
+    free = s.get("free_users", max(0, total - prem))
+    
+    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    text = f"""<b>⚡ NFHUNT BOT — LIVE STATS ⚡</b>
+
+<b>📊 USER DEMOGRAPHICS:</b>
+👥 <b>Total Users (Ever Joined):</b> <code>{total}</code>
+💬 <b>DM (Private Chat) Users:</b> <code>{dm}</code> (<code>{dm_pct}</code>)
+👥 <b>Group / Channel Users:</b> <code>{group}</code> (<code>{grp_pct}</code>)
+
+<b>🔥 REAL-TIME ACTIVITY COUNTER:</b>
+🟢 <b>Live Active (Last 15m):</b> <code>{s.get('live_15m', 0)}</code> users
+⚡ <b>Hourly Active (Last 1h):</b> <code>{s.get('live_1h', 0)}</code> users
+📅 <b>Daily Active Users (DAU 24h):</b> <code>{s.get('daily_active', 0)}</code> users
+📆 <b>Weekly Active Users (WAU 7d):</b> <code>{s.get('weekly_active', 0)}</code> users
+🗓 <b>Monthly Active Users (MAU 30d):</b> <code>{s.get('monthly_active', 0)}</code> users
+
+<b>💎 SUBSCRIPTION BREAKDOWN:</b>
+⭐ <b>Premium / VIP Users:</b> <code>{prem}</code>
+🆓 <b>Free Tier Users:</b> <code>{free}</code>
+
+<b>🎯 SYSTEM USAGE & CHECKS:</b>
+✅ <b>Valid Accounts Found Today:</b> <code>{s.get('total_finds_today', 0)}</code>
+🔍 <b>Total Checks Processed:</b> <code>{s.get('total_checks_all_time', 0)}</code>
+
+━━━━━━━━━━━━━━━━━━━━━
+🕒 <i>Last Synced: {now_str}</i>
+<i>Tap Refresh for real-time live counts.</i>"""
+    return text
+
+def get_stats_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔄 Refresh Stats", callback_data="stats:refresh"),
+            InlineKeyboardButton("👥 Recent DM Users", callback_data="stats:recent")
+        ],
+        [
+            InlineKeyboardButton("❌ Close", callback_data="close_menu")
+        ]
+    ])
+
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id != OWNER_ID:
+    if not is_admin(user_id):
         return
         
     stats = await Database.get_stats()
-    text = f"""📊 *Bot Statistics*
-
-👥 Total Users: {stats['total_users']}
-📅 Active this Week: {stats['weekly_active']}
-📆 Active this Month: {stats['monthly_active']}"""
-    
-    await update.message.reply_text(text, parse_mode='Markdown')
+    text = format_stats_html(stats)
+    await update.message.reply_text(text, parse_mode='HTML', reply_markup=get_stats_keyboard())
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id != OWNER_ID:
+    if not is_admin(user_id):
         return
         
-    text = "👑 *ADMIN PANEL*\n\nSelect an action below to manage users and plans:"
+    text = "👑 <b>ADMIN PANEL</b>\n\nSelect an action below to manage users, plans, and live statistics:"
     keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Live Bot Stats", callback_data="stats:refresh")],
         [InlineKeyboardButton("💎 Grant Plan to User", callback_data="admin:grant")],
         [InlineKeyboardButton("❌ Close", callback_data="close_menu")]
     ])
-    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=keyboard)
+    await update.message.reply_text(text, parse_mode='HTML', reply_markup=keyboard)
 
 
 

@@ -71,10 +71,21 @@ class Database:
             created_at TEXT,
             last_active TEXT,
             daily_valid_finds INTEGER DEFAULT 0,
-            last_reset_time TEXT
+            last_reset_time TEXT,
+            chat_type TEXT DEFAULT 'private',
+            total_checks INTEGER DEFAULT 0
         );
         """
         await cls.raw_execute(create_sql)
+        try:
+            cols_info = await cls.raw_execute("PRAGMA table_info(users)")
+            existing_cols = {col.get("name") for col in cols_info} if cols_info else set()
+            if "chat_type" not in existing_cols:
+                await cls.raw_execute("ALTER TABLE users ADD COLUMN chat_type TEXT DEFAULT 'private'")
+            if "total_checks" not in existing_cols:
+                await cls.raw_execute("ALTER TABLE users ADD COLUMN total_checks INTEGER DEFAULT 0")
+        except Exception:
+            pass
 
     @classmethod
     async def raw_execute(cls, sql: str, params: list | None = None) -> list[dict]:
@@ -120,25 +131,29 @@ class Database:
         return None
 
     @staticmethod
-    async def get_or_create_user(user_id: int, username: str, referrer_id: int = None):
+    async def get_or_create_user(user_id: int, username: str, referrer_id: int = None, chat_type: str = "private"):
         user = await Database.get_user(user_id)
+        now_iso = datetime.utcnow().isoformat()
         if not user:
-            now_iso = datetime.utcnow().isoformat()
             await Database.execute(
                 """
                 INSERT OR IGNORE INTO users (
                     user_id, username, referral_count, referred_by, plan_name,
-                    unlimited_until, created_at, last_active, daily_valid_finds, last_reset_time
-                ) VALUES (?, ?, 0, ?, 'Free', NULL, ?, ?, 0, ?)
+                    unlimited_until, created_at, last_active, daily_valid_finds, last_reset_time,
+                    chat_type, total_checks
+                ) VALUES (?, ?, 0, ?, 'Free', NULL, ?, ?, 0, ?, ?, 0)
                 """,
-                [user_id, username, referrer_id, now_iso, now_iso, now_iso]
+                [user_id, username, referrer_id, now_iso, now_iso, now_iso, chat_type]
             )
 
             # Process referral bonus for referrer
             if referrer_id and referrer_id != user_id:
                 await Database.process_referral(referrer_id)
         else:
-            await Database.update_last_active(user_id)
+            await Database.execute(
+                "UPDATE users SET last_active = ?, username = ?, chat_type = ? WHERE user_id = ?",
+                [now_iso, username, chat_type, user_id]
+            )
 
         return await Database.get_user(user_id)
 
@@ -235,32 +250,91 @@ class Database:
         }
 
     @staticmethod
-    async def update_last_active(user_id: int):
+    async def update_last_active(user_id: int, chat_type: str = "private"):
         now_iso = datetime.utcnow().isoformat()
         await Database.execute(
-            "UPDATE users SET last_active = ? WHERE user_id = ?",
-            [now_iso, user_id]
+            "UPDATE users SET last_active = ?, chat_type = ? WHERE user_id = ?",
+            [now_iso, chat_type, user_id]
         )
+
+    @staticmethod
+    async def record_activity(user_id: int, chat_type: str = "private", increment_checks: int = 0):
+        """Update last active, chat_type, and increment total checks processed."""
+        now_iso = datetime.utcnow().isoformat()
+        if increment_checks > 0:
+            await Database.execute(
+                "UPDATE users SET last_active = ?, chat_type = ?, total_checks = total_checks + ? WHERE user_id = ?",
+                [now_iso, chat_type, increment_checks, user_id]
+            )
+        else:
+            await Database.execute(
+                "UPDATE users SET last_active = ?, chat_type = ? WHERE user_id = ?",
+                [now_iso, chat_type, user_id]
+            )
 
     @staticmethod
     async def get_stats() -> dict:
         now = datetime.utcnow()
-        week_ago_iso = (now - timedelta(days=7)).isoformat()
-        month_ago_iso = (now - timedelta(days=30)).isoformat()
+        m15_iso = (now - timedelta(minutes=15)).isoformat()
+        h1_iso = (now - timedelta(hours=1)).isoformat()
+        d1_iso = (now - timedelta(hours=24)).isoformat()
+        w1_iso = (now - timedelta(days=7)).isoformat()
+        m1_iso = (now - timedelta(days=30)).isoformat()
+        now_iso = now.isoformat()
 
         total_res = await Database.execute("SELECT COUNT(*) as total FROM users")
-        weekly_res = await Database.execute("SELECT COUNT(*) as total FROM users WHERE last_active >= ?", [week_ago_iso])
-        monthly_res = await Database.execute("SELECT COUNT(*) as total FROM users WHERE last_active >= ?", [month_ago_iso])
+        live_res = await Database.execute("SELECT COUNT(*) as total FROM users WHERE last_active >= ?", [m15_iso])
+        h1_res = await Database.execute("SELECT COUNT(*) as total FROM users WHERE last_active >= ?", [h1_iso])
+        d1_res = await Database.execute("SELECT COUNT(*) as total FROM users WHERE last_active >= ?", [d1_iso])
+        w1_res = await Database.execute("SELECT COUNT(*) as total FROM users WHERE last_active >= ?", [w1_iso])
+        m1_res = await Database.execute("SELECT COUNT(*) as total FROM users WHERE last_active >= ?", [m1_iso])
+
+        dm_res = await Database.execute("SELECT COUNT(*) as total FROM users WHERE chat_type = 'private' OR chat_type IS NULL")
+        grp_res = await Database.execute("SELECT COUNT(*) as total FROM users WHERE chat_type != 'private' AND chat_type IS NOT NULL")
+
+        prem_res = await Database.execute(
+            "SELECT COUNT(*) as total FROM users WHERE plan_name != 'Free' OR (unlimited_until IS NOT NULL AND unlimited_until > ?)",
+            [now_iso]
+        )
+        finds_res = await Database.execute("SELECT SUM(daily_valid_finds) as finds, SUM(total_checks) as checks FROM users")
 
         total_users = total_res[0]["total"] if total_res else 0
-        weekly_active = weekly_res[0]["total"] if weekly_res else 0
-        monthly_active = monthly_res[0]["total"] if monthly_res else 0
+        live_15m = live_res[0]["total"] if live_res else 0
+        live_1h = h1_res[0]["total"] if h1_res else 0
+        daily_active = d1_res[0]["total"] if d1_res else 0
+        weekly_active = w1_res[0]["total"] if w1_res else 0
+        monthly_active = m1_res[0]["total"] if m1_res else 0
+
+        dm_users = dm_res[0]["total"] if dm_res else 0
+        group_users = grp_res[0]["total"] if grp_res else 0
+        premium_users = prem_res[0]["total"] if prem_res else 0
+        free_users = max(0, total_users - premium_users)
+
+        total_finds = (finds_res[0]["finds"] if finds_res and finds_res[0].get("finds") else 0) or 0
+        total_checks = (finds_res[0]["checks"] if finds_res and finds_res[0].get("checks") else 0) or 0
 
         return {
             "total_users": total_users,
+            "live_15m": live_15m,
+            "live_1h": live_1h,
+            "daily_active": daily_active,
             "weekly_active": weekly_active,
-            "monthly_active": monthly_active
+            "monthly_active": monthly_active,
+            "dm_users": dm_users,
+            "group_users": group_users,
+            "premium_users": premium_users,
+            "free_users": free_users,
+            "total_finds_today": total_finds,
+            "total_checks_all_time": total_checks
         }
+
+    @staticmethod
+    async def get_recent_users(limit: int = 10) -> list[dict]:
+        rows = await Database.execute(
+            "SELECT user_id, username, plan_name, last_active, chat_type, daily_valid_finds, total_checks FROM users ORDER BY last_active DESC LIMIT ?",
+            [limit]
+        )
+        return [_deserialize_user(r) for r in rows] if rows else []
 
     @staticmethod
     async def give_access(user_id: int, days: int, plan_name: str = "Premium") -> bool:

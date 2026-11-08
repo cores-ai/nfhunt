@@ -36,6 +36,22 @@ if not _token:
 BOT_TOKEN: str = _validate_token_or_raise(_token)
 OWNER_ID: int = int(os.getenv("OWNER_ID", "7562427494"))
 
+def _parse_admin_ids() -> set[int]:
+    raw = os.getenv("ADMIN_IDS", "").strip()
+    ids = {OWNER_ID}
+    if raw:
+        for part in re.split(r"[,;\s]+", raw):
+            try:
+                ids.add(int(part.strip()))
+            except ValueError:
+                pass
+    return ids
+
+ADMIN_IDS: set[int] = _parse_admin_ids()
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS or user_id == OWNER_ID
+
 # Cloudflare D1 Database Configuration
 CF_ACCOUNT_ID: str = os.getenv("CF_ACCOUNT_ID", "").strip()
 CF_D1_DATABASE_ID: str = os.getenv("CF_D1_DATABASE_ID", "").strip()
