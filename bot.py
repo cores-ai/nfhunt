@@ -1940,6 +1940,33 @@ async def handle_valid_drop(update, context, start: int):
     except Exception:
         pass
 
+def _start_health_check_server_if_needed():
+    """Start lightweight HTTP server on PORT for Railway / PaaS health checks"""
+    port_str = os.getenv("PORT")
+    if not port_str:
+        return
+    try:
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        import threading
+
+        class HealthCheckHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"status": "ok", "service": "nfhunt-bot"}')
+
+            def log_message(self, format, *args):
+                pass
+
+        port = int(port_str)
+        server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        logger.info(f"Health check HTTP server started on port {port}")
+    except Exception as e:
+        logger.warning(f"Could not start health check server on port {port_str}: {e}")
+
 def main():
     """Start the bot"""
     import sys
@@ -1948,6 +1975,7 @@ def main():
         
     # Clean artifacts at startup for server/GitHub hygiene
     _cleanup_artifacts(aggressive=True)
+    _start_health_check_server_if_needed()
     application = Application.builder().token(BOT_TOKEN).build()
     
     # Add only essential handlers
